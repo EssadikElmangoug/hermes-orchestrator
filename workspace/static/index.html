@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Agents Workspace</title>
+<style>
+:root {
+  --bg: #0d1117; --panel: #161b22; --border: #30363d; --text: #e6edf3;
+  --muted: #8b949e; --accent: #d4a017; --green: #3fb950; --red: #f85149;
+  --amber: #d29922; --blue: #58a6ff;
+}
+* { box-sizing: border-box; margin: 0; }
+body { background: var(--bg); color: var(--text); font: 14px/1.5 system-ui, sans-serif; }
+header { display: flex; align-items: center; gap: 24px; padding: 14px 24px;
+  border-bottom: 1px solid var(--border); background: var(--panel); }
+header h1 { font-size: 16px; letter-spacing: 2px; text-transform: uppercase; color: var(--accent); }
+nav { display: flex; gap: 4px; }
+nav button { background: none; border: 1px solid transparent; color: var(--muted);
+  padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+nav button.active { color: var(--text); border-color: var(--border); background: var(--bg); }
+nav button:hover { color: var(--text); }
+main { padding: 24px; max-width: 1200px; margin: 0 auto; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; }
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+.card h3 { display: flex; align-items: center; gap: 8px; font-size: 15px; }
+.dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+.dot.on { background: var(--green); } .dot.off { background: var(--red); }
+.dot.warn { background: var(--amber); }
+.meta { color: var(--muted); font-size: 12px; margin: 6px 0 10px; }
+.badge { display: inline-block; font-size: 11px; padding: 1px 8px; border-radius: 10px;
+  border: 1px solid var(--border); color: var(--muted); margin-right: 6px; }
+.badge.fixer { border-color: var(--accent); color: var(--accent); }
+.row { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+button.act { background: var(--bg); color: var(--text); border: 1px solid var(--border);
+  padding: 4px 10px; border-radius: 6px; cursor: pointer; font-size: 12px; }
+button.act:hover { border-color: var(--muted); }
+button.act.primary { border-color: var(--accent); color: var(--accent); }
+button.act.danger { border-color: var(--red); color: var(--red); }
+button.act:disabled { opacity: .4; cursor: default; }
+.formrow { display: flex; gap: 8px; margin-bottom: 20px; flex-wrap: wrap; }
+input, textarea { background: var(--bg); border: 1px solid var(--border); color: var(--text);
+  padding: 7px 10px; border-radius: 6px; font-size: 13px; }
+input:focus, textarea:focus { outline: none; border-color: var(--accent); }
+#log-view, pre.log { background: #010409; border: 1px solid var(--border); border-radius: 8px;
+  padding: 12px; font: 12px/1.5 ui-monospace, monospace; white-space: pre-wrap;
+  max-height: 420px; overflow: auto; color: #c9d1d9; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; }
+td.detail { font: 11px/1.4 ui-monospace, monospace; color: var(--muted);
+  max-width: 480px; overflow: hidden; }
+.kind-crash { color: var(--red); } .kind-log_error { color: var(--amber); } .kind-health { color: var(--blue); }
+#graph-svg { width: 100%; min-height: 480px; background: var(--panel);
+  border: 1px solid var(--border); border-radius: 8px; }
+.modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: flex;
+  align-items: center; justify-content: center; z-index: 10; }
+.modal { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  padding: 20px; width: min(720px, 92vw); max-height: 86vh; overflow: auto; }
+.modal h2 { font-size: 16px; margin-bottom: 4px; }
+.tabs { display: flex; gap: 4px; margin: 14px 0; border-bottom: 1px solid var(--border); }
+.tabs button { background: none; border: none; color: var(--muted); padding: 8px 14px;
+  cursor: pointer; border-bottom: 2px solid transparent; font-size: 13px; }
+.tabs button.active { color: var(--text); border-bottom-color: var(--accent); }
+.sub-item { display: flex; justify-content: space-between; align-items: center;
+  padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; margin-bottom: 8px; }
+.empty { color: var(--muted); padding: 20px 0; text-align: center; }
+.toast { position: fixed; bottom: 20px; right: 20px; background: var(--panel);
+  border: 1px solid var(--accent); border-radius: 8px; padding: 10px 16px; z-index: 20; }
+a { color: var(--blue); }
+</style>
+</head>
+<body>
+<header>
+  <h1>☤ Agents Workspace</h1>
+  <nav>
+    <button data-view="agents" class="active">Agents</button>
+    <button data-view="graph">Graph</button>
+    <button data-view="shared">Shared</button>
+    <button data-view="incidents">Incidents</button>
+  </nav>
+</header>
+<main id="main"></main>
+<script src="/static/app.js"></script>
+</body>
+</html>

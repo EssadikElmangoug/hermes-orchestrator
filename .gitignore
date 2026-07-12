@@ -1,0 +1,14 @@
+# Local runtime and secrets
+hermes-venv/
+hermes-home/
+agents/
+
+# Workspace runtime state
+workspace/__pycache__/
+workspace/*.log
+workspace/*.json
+workspace/shared/
+
+# Python cache
+**/__pycache__/
+*.pyc
