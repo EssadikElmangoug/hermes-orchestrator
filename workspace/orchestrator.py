@@ -31,9 +31,21 @@ AGENTS_DIR = ROOT / "agents"
 SHARED_DIR = WORKSPACE / "shared"
 REGISTRY_PATH = WORKSPACE / "registry.json"
 INCIDENTS_PATH = WORKSPACE / "incidents.json"
-VENV_BIN = ROOT / "hermes-venv" / "bin"
-HERMES_BIN = VENV_BIN / "hermes"
-MAIN_HOME = ROOT / "hermes-home"
+
+
+def _find_hermes() -> Path:
+    """Prefer a workspace-bundled venv, else the machine's installed hermes."""
+    bundled = ROOT / "hermes-venv" / "bin" / "hermes"
+    if bundled.exists():
+        return bundled
+    found = shutil.which("hermes")
+    if found:
+        return Path(found).resolve()
+    return Path("/usr/local/lib/hermes-agent/venv/bin/hermes")
+
+
+HERMES_BIN = _find_hermes()
+VENV_BIN = HERMES_BIN.parent
 
 API_PORT_BASE = 9301
 DASH_PORT_BASE = 9401
@@ -89,23 +101,344 @@ def _next_port(reg: Dict[str, Any], key: str, base: int) -> int:
     return port
 
 
+# ─── installed-gateway discovery (adopted, read-only) ───────────────────────
+#
+# Machines that already run Hermes (systemd units like hermes-gateway.service
+# and hermes-gateway-<profile>.service) get those gateways ADOPTED into the
+# workspace: they appear in the agent list, graph and dashboards, can be
+# started/stopped through their own systemd unit, and their config seeds the
+# shared layer — but the workspace NEVER writes into their homes, .env,
+# config, memory or profiles. Breaking an existing install is not an option.
+
+_UNIT_RE = re.compile(r"^(hermes-gateway(?:-([a-z0-9][a-z0-9-]*))?)\.service$")
+
+
+def _truthy(value: str) -> bool:
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _read_env_keys(env_path: Path) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    try:
+        text = env_path.read_text()
+    except OSError:
+        return out
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            key, val = stripped.split("=", 1)
+            out[key.strip()] = val.strip().strip('"').strip("'")
+    return out
+
+
+def _detect_api_server(home: Path) -> tuple:
+    """(port, key) of an installed agent's OpenAI-compatible API server, or
+    (None, "") when it doesn't expose one. Read-only: nothing is enabled."""
+    env = _read_env_keys(home / ".env")
+    if not _truthy(env.get("API_SERVER_ENABLED", "")):
+        return None, ""
+    try:
+        port = int(env.get("API_SERVER_PORT", "") or 8642)
+    except ValueError:
+        port = 8642
+    return port, env.get("API_SERVER_KEY", "")
+
+
+def _port_open(port: int) -> bool:
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+def _systemctl(agent: Dict[str, Any], *args: str,
+               timeout: int = 60) -> subprocess.CompletedProcess:
+    cmd = ["systemctl"]
+    if agent.get("scope", "user") != "system":
+        cmd.append("--user")
+    cmd += [*args, agent.get("unit", "hermes-gateway.service")]
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+def _list_gateway_units() -> List[Dict[str, str]]:
+    """All hermes-gateway*.service units on this machine (user then system)."""
+    units: List[Dict[str, str]] = []
+    for scope_flag, scope in ((["--user"], "user"), ([], "system")):
+        r = subprocess.run(
+            ["systemctl", *scope_flag, "list-unit-files",
+             "hermes-gateway*.service", "--no-legend", "--plain"],
+            capture_output=True, text=True)
+        if r.returncode != 0:
+            continue
+        for line in r.stdout.splitlines():
+            fields = line.split()
+            m = _UNIT_RE.match(fields[0]) if fields else None
+            if m and not any(u["unit"] == m.group(0) for u in units):
+                units.append({"unit": m.group(0), "scope": scope,
+                              "profile": m.group(2) or ""})
+    return units
+
+
+def _unit_home(unit: Dict[str, str]) -> Path:
+    """HERMES_HOME a unit runs against (from its Environment=, else default)."""
+    scope_flag = ["--user"] if unit["scope"] == "user" else []
+    r = subprocess.run(
+        ["systemctl", *scope_flag, "show", "-p", "Environment", unit["unit"]],
+        capture_output=True, text=True)
+    m = re.search(r"HERMES_HOME=(\S+)", r.stdout or "")
+    if m:
+        return Path(m.group(1))
+    root = Path.home() / ".hermes"
+    return root / "profiles" / unit["profile"] if unit["profile"] else root
+
+
+def _soul_summary(home: Path) -> str:
+    try:
+        for line in (home / "SOUL.md").read_text().splitlines():
+            line = line.strip().lstrip("#").strip()
+            if line:
+                return line[:120]
+    except OSError:
+        pass
+    return ""
+
+
+def _merge_webhooks_from(home: Path) -> bool:
+    """Merge webhook routes an installed agent defined into the shared
+    subscriptions file (shared wins on name collisions). A plain
+    copy-if-missing would only ever propagate the FIRST webhook."""
+    src = home / "webhook_subscriptions.json"
+    if not src.is_file():
+        return False
+    try:
+        theirs = json.loads(src.read_text())
+    except Exception:
+        return False
+    if not isinstance(theirs, dict):
+        return False
+    dst = SHARED_DIR / "webhook_subscriptions.json"
+    ours = _load(dst, {})
+    added = {k: v for k, v in theirs.items() if k not in ours}
+    if not added:
+        return False
+    ours.update(added)
+    tmp = dst.with_suffix(".tmp")
+    tmp.write_text(json.dumps(ours, indent=2))
+    tmp.chmod(0o600)                    # per-route HMAC secrets live in here
+    tmp.replace(dst)
+    return True
+
+
+def _merge_missing(src: Path, dst: Path) -> List[str]:
+    """Recursively copy entries of src that dst lacks; existing dst entries
+    always win and are never modified. Descends into directories present on
+    both sides, so an item created inside an existing subtree still
+    propagates — skills live at skills/<category>/<skill>/, and a new skill
+    in an already-shared category is invisible to a single-level copy.
+    Returns the copied paths relative to src."""
+    copied: List[str] = []
+    stack = [(src, dst, "")]
+    while stack:
+        s, d, prefix = stack.pop()
+        try:
+            entries = list(s.iterdir())
+        except OSError:
+            continue
+        for item in entries:
+            if item.is_symlink() and not item.exists():
+                continue
+            dest = d / item.name
+            rel = prefix + item.name
+            try:
+                if item.is_dir() and not item.is_symlink():
+                    if dest.is_dir():
+                        stack.append((item, dest, rel + "/"))
+                    elif not dest.exists():
+                        shutil.copytree(item, dest, symlinks=True)
+                        copied.append(rel)
+                elif not dest.exists():
+                    shutil.copy2(item, dest, follow_symlinks=False)
+                    copied.append(rel)
+            except OSError:
+                pass
+    return copied
+
+
+def seed_shared_from_home(home: Path,
+                          dirs=("skills", "memories", "bin", "clis", "plugins"),
+                          include_auth: bool = True,
+                          include_webhooks: bool = True) -> List[str]:
+    """COPY (never move or modify) an installed agent's reusable resources
+    into workspace/shared so future workspace agents inherit them: provider
+    OAuth (auth.json), webhook routes, skills, memories, CLI tools (bin) and
+    CLI manifests (clis). Existing shared entries always win — seeding never
+    overwrites. Runs at adoption AND every sync pass, so resources the
+    installed agent creates later (new skills, tools, webhooks…) flow into
+    the shared layer too — not just what existed at adoption time."""
+    ensure_shared_seed()
+    copied: List[str] = []
+    if include_auth:
+        src = home / "auth.json"
+        dst = SHARED_DIR / "auth.json"
+        if src.is_file() and not dst.exists():
+            shutil.copy2(src, dst)
+            copied.append("auth.json")
+    if include_webhooks and _merge_webhooks_from(home):
+        copied.append("webhook_subscriptions.json")
+    for sub in dirs:
+        src = home / sub
+        if not src.is_dir():
+            continue
+        dst_root = SHARED_DIR / sub
+        dst_root.mkdir(exist_ok=True)
+        copied.extend(f"{sub}/{rel}" for rel in _merge_missing(src, dst_root))
+    return copied
+
+
+UNIT_SNAP_DIR = WORKSPACE / "unit_snapshots"
+
+
+def _adopted_unit_path(agent: Dict[str, Any]) -> Optional[Path]:
+    unit = agent.get("unit")
+    if not unit:
+        return None
+    if agent.get("scope") == "system":
+        return Path("/etc/systemd/system") / unit
+    return Path.home() / ".config" / "systemd" / "user" / unit
+
+
+def guard_adopted_units() -> List[str]:
+    """Protect installed gateways' systemd unit files.
+
+    Hermes gateways rewrite their own unit definition at boot, and a gateway
+    started with a custom HERMES_HOME resolves to the DEFAULT unit name — so
+    a stray process can clobber an installed agent's unit to point at the
+    wrong home. While the unit is correct we keep a snapshot; if it ever
+    stops pointing at the adopted agent's real home, we restore the snapshot
+    and record an incident. Legitimate unit updates (still pointing at the
+    right home) simply refresh the snapshot.
+    """
+    repaired: List[str] = []
+    reg = load_registry()
+    for name, agent in reg["agents"].items():
+        if not agent.get("adopted"):
+            continue
+        path = _adopted_unit_path(agent)
+        if not path or not path.exists():
+            continue
+        try:
+            text = path.read_text()
+        except OSError:
+            continue
+        m = re.search(r'HERMES_HOME=([^"\n]+)', text)
+        current_home = Path(m.group(1)) if m else Path.home() / ".hermes"
+        snap = UNIT_SNAP_DIR / f"{agent.get('scope', 'user')}-{path.name}"
+        if current_home.resolve() == Path(agent["home"]).resolve():
+            UNIT_SNAP_DIR.mkdir(parents=True, exist_ok=True)
+            if not snap.exists() or snap.read_text() != text:
+                snap.write_text(text)
+        elif snap.exists():
+            path.write_text(snap.read_text())
+            scope_flag = [] if agent.get("scope") == "system" else ["--user"]
+            subprocess.run(["systemctl", *scope_flag, "daemon-reload"],
+                           capture_output=True, timeout=30)
+            repaired.append(name)
+            inc = record_incident(
+                name, "unit_clobbered",
+                f"{path} pointed HERMES_HOME at {current_home} instead of "
+                f"{agent['home']}; restored from snapshot",
+                "unit file restored from workspace snapshot")
+            if inc:
+                dispatch_to_fixer(inc)
+    return repaired
+
+
+def adopt_installed() -> List[str]:
+    """Discover installed Hermes gateways and register them as adopted,
+    read-only agents. Idempotent; never touches the installs themselves."""
+    adopted: List[str] = []
+    with _lock:
+        reg = load_registry()
+        known_homes = {str(Path(a["home"]).resolve())
+                       for a in reg["agents"].values()}
+        for unit in _list_gateway_units():
+            home = _unit_home(unit)
+            if not home.is_dir() or str(home.resolve()) in known_homes:
+                continue
+            name = unit["profile"] or "main"
+            if name in reg["agents"] or not NAME_RE.match(name):
+                name = f"installed-{name}"[:32]
+                if name in reg["agents"] or not NAME_RE.match(name):
+                    continue
+            api_port, api_key = _detect_api_server(home)
+            desc = _soul_summary(home) or (
+                f"Installed Hermes gateway ({unit['unit']})")
+            if unit["profile"]:
+                desc = f"{desc} — profile of the main install"
+            reg["agents"][name] = {
+                "home": str(home),
+                "api_port": api_port,
+                "dash_port": (9119 if not unit["profile"] and _port_open(9119)
+                              else _next_port(reg, "dash_port", DASH_PORT_BASE)),
+                "api_key": api_key,
+                "description": desc,
+                "created": time.time(),
+                "external": True,        # supervised by systemd, not by us
+                "adopted": True,         # pre-existing install, found on disk
+                "read_only": True,       # the workspace never writes its home
+                "contribute": not unit["profile"],   # only main seeds config
+                "unit": unit["unit"],
+                "scope": unit["scope"],
+                "autostart": False,
+            }
+            known_homes.add(str(home.resolve()))
+            adopted.append(name)
+            if not unit["profile"]:
+                seed_shared_from_home(home)
+        if adopted:
+            save_registry(reg)
+    return adopted
+
+
 # ─── agent lifecycle ─────────────────────────────────────────────────────────
 
 def _agent_env(agent: Dict[str, Any]) -> Dict[str, str]:
     env = dict(os.environ)
     env["HERMES_HOME"] = agent["home"]
-    env["PATH"] = f"{VENV_BIN}:{env.get('PATH', '')}"
+    # home/bin (→ shared/bin for workspace agents) goes on PATH so shared
+    # CLI tools are invocable by name, not just present on disk.
+    env["PATH"] = f"{VENV_BIN}:{Path(agent['home']) / 'bin'}:{env.get('PATH', '')}"
     env.pop("VIRTUAL_ENV", None)
+    # Confine HOME to the agent's directory. Hermes gateways "self-heal"
+    # their systemd unit file under ~/.config/systemd/user on every boot,
+    # and a gateway with a custom (non-profile) HERMES_HOME resolves to the
+    # DEFAULT unit name — without this, starting any workspace agent would
+    # rewrite the machine's real hermes-gateway.service to point at the
+    # workspace agent's home, breaking a pre-existing install on its next
+    # restart. With HOME set to the agent dir, HERMES_HOME is exactly
+    # $HOME/.hermes (a standard layout) and every user-scope file hermes
+    # manages stays inside the agent's own directory. Adopted installs keep
+    # the real HOME — they must behave exactly as the user runs them.
+    if not agent.get("external"):
+        env["HOME"] = str(Path(agent["home"]).parent)
+        env.pop("XDG_CONFIG_HOME", None)
     return env
 
 
 # Per-agent config sections that must NEVER be shared: channels are bound to
-# one agent identity, and the dashboard block is instance-local.
-_CONFIG_PER_AGENT_KEYS = ("platforms", "dashboard")
+# one agent identity (platforms, and hermes's top-level whatsapp block), and
+# the dashboard block is instance-local.
+_CONFIG_PER_AGENT_KEYS = ("platforms", "dashboard", "whatsapp")
 
 # Files/dirs physically stored in workspace/shared and symlinked into every
-# agent's home (including main): provider OAuth, long-term memory, skills.
-_SHARED_LINKS = ("auth.json", "memories", "skills")
+# workspace-created agent's home: provider OAuth, long-term memory, skills,
+# home-local CLI tools (bin + clis manifests), and webhook route definitions.
+# Adopted (pre-installed) agents are NEVER linked — their homes are read-only
+# to the workspace; they only seed these by copy.
+_SHARED_LINKS = ("auth.json", "webhook_subscriptions.json",
+                 "memories", "skills", "bin", "clis", "plugins")
 
 _ENV_BLOCK_BEGIN = "# >>> workspace shared (managed — edits inside are overwritten) >>>"
 _ENV_BLOCK_END = "# <<< workspace shared <<<"
@@ -171,19 +504,23 @@ def _ensure_shared_links(home: Path) -> bool:
         shared = SHARED_DIR / name
         target = home / name
         if name.endswith(".json"):
-            # A token refresh replaces the symlink with a real file (atomic
-            # rename). Never lose that: the newer file wins and becomes the
-            # shared copy before re-linking.
+            # A token refresh or route write replaces the symlink with a real
+            # file (atomic rename). Never lose that before re-linking.
             if target.is_file() and not target.is_symlink():
-                if not shared.exists() or target.stat().st_mtime > shared.stat().st_mtime:
+                if name == "webhook_subscriptions.json":
+                    # Routes are independent entries — merge per route so a
+                    # diverged file can't clobber routes other agents added
+                    # to the shared copy meanwhile.
+                    _merge_webhooks_from(home)
+                elif not shared.exists() or target.stat().st_mtime > shared.stat().st_mtime:
                     shutil.copy2(target, shared)
         else:
             shared.mkdir(exist_ok=True)
             if target.is_dir() and not target.is_symlink():
-                for item in target.iterdir():
-                    dest = shared / item.name
-                    if not dest.exists():
-                        shutil.move(str(item), dest)
+                # Must be recursive: a one-level move drops anything nested
+                # inside a subtree shared already has, and the rmtree below
+                # would then destroy the only copy.
+                _merge_missing(target, shared)
         if target.is_symlink():
             if target.resolve() == shared.resolve():
                 continue
@@ -217,6 +554,33 @@ def _apply_shared_config(home: Path, shared_cfg: Dict[str, Any]) -> bool:
     return False
 
 
+def _merge_cfg_edits(prev: Dict[str, Any], view: Dict[str, Any],
+                     out: Dict[str, Any]) -> None:
+    """Fold one editor's config changes (its view vs the previous canonical
+    state) into out. Dict-valued sections (mcp_servers, tools…) merge per
+    sub-key, so two agents adding different entries in the same window both
+    land — a whole-section diff would let the newer editor silently clobber
+    the other's addition. Sub-keys an editor removed are removed."""
+    for key in set(view) | set(prev):
+        ours, theirs = prev.get(key), view.get(key)
+        if theirs == ours:
+            continue
+        if key not in view:
+            out.pop(key, None)
+        elif isinstance(theirs, dict) and isinstance(ours, dict):
+            base = out.get(key)
+            merged = dict(base) if isinstance(base, dict) else dict(ours)
+            for sub in set(theirs) | set(ours):
+                if theirs.get(sub) != ours.get(sub):
+                    if sub in theirs:
+                        merged[sub] = theirs[sub]
+                    else:
+                        merged.pop(sub, None)
+            out[key] = merged
+        else:
+            out[key] = theirs
+
+
 SHARED_STATE_PATH = WORKSPACE / "shared_state.json"
 _last_sync_restart: Dict[str, float] = {}
 
@@ -247,9 +611,13 @@ def sync_shared(restart_changed: bool = True, force: bool = False) -> Dict[str, 
         prev_env: Dict[str, str] = state["env"]
         mtimes: Dict[str, Dict[str, float]] = state["mtimes"]
 
-        # 1. collect edits (agents whose files moved since last pass)
+        # 1. collect edits (agents whose files moved since last pass).
+        # Adopted profile gateways don't contribute: they are clones of the
+        # main install and would fight it for canonical state.
         editors = []
         for name, agent in reg["agents"].items():
+            if not agent.get("contribute", True):
+                continue
             home = Path(agent["home"])
             cfg_m = _file_mtime(home / "config.yaml")
             env_m = _file_mtime(home / ".env")
@@ -261,13 +629,7 @@ def sync_shared(restart_changed: bool = True, force: bool = False) -> Dict[str, 
         new_cfg = dict(prev_cfg)
         new_env = dict(prev_env)
         for _, name, home in editors:
-            cfg_view = _shareable_config_view(home)
-            for key in set(cfg_view) | set(prev_cfg):
-                if cfg_view.get(key) != prev_cfg.get(key):
-                    if key in cfg_view:
-                        new_cfg[key] = cfg_view[key]
-                    else:
-                        new_cfg.pop(key, None)
+            _merge_cfg_edits(prev_cfg, _shareable_config_view(home), new_cfg)
             env_view = _shareable_env_view(home / ".env")
             for key in set(env_view) | set(prev_env):
                 if env_view.get(key) != prev_env.get(key):
@@ -283,6 +645,27 @@ def sync_shared(restart_changed: bool = True, force: bool = False) -> Dict[str, 
         env_lines = [new_env[k] for k in sorted(new_env)]
         for name, agent in reg["agents"].items():
             home = Path(agent["home"])
+            if agent.get("read_only"):
+                # Adopted installs are sources only — record what we read so
+                # they aren't re-treated as editors, but NEVER write to them.
+                mtimes[name] = {"cfg": _file_mtime(home / "config.yaml"),
+                                "env": _file_mtime(home / ".env")}
+                # Resources adopted agents create (skills, CLI tools,
+                # webhooks, memories) flow into the shared layer
+                # continuously — copy-only, never move. Profile gateways
+                # contribute their functional resources but not memories,
+                # auth, or config (they are clones of main; letting them
+                # fight over canonical config/identity would cause churn).
+                try:
+                    if agent.get("contribute"):
+                        seed_shared_from_home(home)
+                    else:
+                        seed_shared_from_home(
+                            home, dirs=("skills", "bin", "clis", "plugins"),
+                            include_auth=False, include_webhooks=False)
+                except Exception:
+                    pass
+                continue
             changed = _ensure_shared_links(home)
             changed |= _apply_shared_config(home, new_cfg)
             changed |= _apply_env_block(home / ".env", env_lines)
@@ -293,12 +676,8 @@ def sync_shared(restart_changed: bool = True, force: bool = False) -> Dict[str, 
                 recently = time.time() - _last_sync_restart.get(name, 0) < 300
                 if restart_changed and is_running(name) and not recently:
                     _last_sync_restart[name] = time.time()
-                    if agent.get("external"):
-                        subprocess.run(["systemctl", "--user", "restart", "hermes-gateway"],
-                                       capture_output=True, timeout=60)
-                    else:
-                        stop_agent(name)
-                        start_agent(name)
+                    stop_agent(name)
+                    start_agent(name)
                     report["restarted"].append(name)
 
         state.update({"config": new_cfg, "env": new_env, "mtimes": mtimes})
@@ -325,7 +704,14 @@ def shared_summary() -> Dict[str, Any]:
         "mcp_servers": sorted((cfg.get("mcp_servers") or {}).keys()),
         "env_keys": sorted(state["env"].keys()),
         "providers": providers,
-        "skills": sorted(p.name for p in skills_dir.iterdir() if p.is_dir()) if skills_dir.is_dir() else [],
+        # Real skills (dirs holding a SKILL.md), not just top-level category
+        # folders — categories hid whether a nested skill was actually shared.
+        "skills": sorted(
+            str(p.parent.relative_to(skills_dir))
+            for p in skills_dir.rglob("SKILL.md")) if skills_dir.is_dir() else [],
+        "plugins": sorted(
+            p.name for p in (SHARED_DIR / "plugins").iterdir()
+            if p.is_dir()) if (SHARED_DIR / "plugins").is_dir() else [],
         "last_sync": _load(WORKSPACE / "last_sync.json", {}),
         "source": "any agent — last writer wins",
     }
@@ -334,8 +720,8 @@ def shared_summary() -> Dict[str, Any]:
 def ensure_shared_seed() -> None:
     """Create workspace/shared and migrate main's shareable files into it."""
     SHARED_DIR.mkdir(parents=True, exist_ok=True)
-    (SHARED_DIR / "memories").mkdir(exist_ok=True)
-    (SHARED_DIR / "skills").mkdir(exist_ok=True)
+    for sub in ("memories", "skills", "bin", "clis", "plugins"):
+        (SHARED_DIR / sub).mkdir(exist_ok=True)
 
 
 def create_agent(name: str, description: str = "", soul: str = "") -> Dict[str, Any]:
@@ -387,43 +773,6 @@ def create_agent(name: str, description: str = "", soul: str = "") -> Dict[str, 
         return reg["agents"][name]
 
 
-def register_main() -> None:
-    """Register the pre-existing hermes-home install as agent 'main'.
-
-    It is supervised by systemd (hermes-gateway.service), not by us.
-    """
-    with _lock:
-        reg = load_registry()
-        if "main" in reg["agents"]:
-            return
-        api_key = secrets.token_urlsafe(24)
-        env_path = MAIN_HOME / ".env"
-        text = env_path.read_text() if env_path.exists() else ""
-        if "API_SERVER_ENABLED" not in text:
-            text = text.rstrip() + (
-                "\n\n# Per-agent API server (workspace-managed)\n"
-                "API_SERVER_ENABLED=1\nAPI_SERVER_HOST=127.0.0.1\n"
-                f"API_SERVER_PORT={API_PORT_BASE - 1}\nAPI_SERVER_KEY={api_key}\n"
-            )
-            env_path.write_text(text)
-        else:
-            m = re.search(r"API_SERVER_KEY=(\S+)", text)
-            api_key = m.group(1) if m else api_key
-        reg["agents"]["main"] = {
-            "home": str(MAIN_HOME),
-            "api_port": API_PORT_BASE - 1,
-            "dash_port": 9119,
-            "api_key": api_key,
-            "description": "Primary agent (original hermes-home, systemd-managed)",
-            "created": time.time(),
-            "external": True,
-            "autostart": True,
-        }
-        save_registry(reg)
-        subprocess.run(["systemctl", "--user", "restart", "hermes-gateway"],
-                       capture_output=True, timeout=60)
-
-
 def delete_agent(name: str) -> None:
     with _lock:
         reg = load_registry()
@@ -431,7 +780,9 @@ def delete_agent(name: str) -> None:
         if not agent:
             raise ValueError(f"No such agent: {name}")
         if agent.get("external"):
-            raise ValueError("The main agent cannot be deleted from the workspace")
+            raise ValueError(
+                "This is an adopted pre-installed gateway — the workspace "
+                "never deletes or modifies existing Hermes installs")
         stop_agent(name)
         stop_dashboard(name)
         agent_dir = Path(agent["home"]).parent
@@ -450,8 +801,7 @@ def start_agent(name: str) -> None:
         reg = load_registry()
         agent = reg["agents"][name]
         if agent.get("external"):
-            subprocess.run(["systemctl", "--user", "start", "hermes-gateway"],
-                           capture_output=True, timeout=60)
+            _systemctl(agent, "start")
             return
         if is_running(name):
             agent["should_run"] = True
@@ -478,8 +828,10 @@ def stop_agent(name: str) -> None:
         reg = load_registry()
         agent = reg["agents"][name]
         if agent.get("external"):
-            subprocess.run(["systemctl", "--user", "stop", "hermes-gateway"],
-                           capture_output=True, timeout=60)
+            # Only closes dashboards the workspace itself spawned; an
+            # install's own dashboard service is never touched.
+            stop_dashboard(name)
+            _systemctl(agent, "stop")
             return
         agent["should_run"] = False
         save_registry(reg)
@@ -535,9 +887,7 @@ def is_running(name: str) -> bool:
     if not agent:
         return False
     if agent.get("external"):
-        r = subprocess.run(["systemctl", "--user", "is-active", "hermes-gateway"],
-                           capture_output=True, text=True)
-        return r.stdout.strip() == "active"
+        return _systemctl(agent, "is-active").stdout.strip() == "active"
     proc = _procs.get(name)
     if proc is not None:
         return proc.poll() is None
@@ -559,7 +909,7 @@ def dash_is_running(name: str) -> bool:
     if not agent:
         return False
     if agent.get("external"):
-        return True
+        return _port_open(agent["dash_port"])
     proc = _dash_procs.get(name)
     if proc is not None and proc.poll() is None:
         return True
@@ -573,7 +923,9 @@ def start_dashboard(name: str) -> str:
         reg = load_registry()
         agent = reg["agents"][name]
         port = agent["dash_port"]
-        if agent.get("external"):
+        if agent.get("external") and _port_open(port):
+            # An already-running dashboard (e.g. the install's own systemd
+            # dashboard service) is reused as-is.
             return f"http://127.0.0.1:{port}"
         # The dashboard's embedded chat runs the agent directly (not via the
         # gateway), so it must not exist while the agent is stopped.
@@ -582,7 +934,14 @@ def start_dashboard(name: str) -> str:
                 f"Agent '{name}' is stopped — start it before opening its dashboard"
             )
         if not dash_is_running(name):
-            log = open(Path(agent["home"]).parent / "dashboard.log", "ab")
+            if agent.get("read_only"):
+                # Never write anything into an adopted install's directory —
+                # even a log file. Keep it in the workspace instead.
+                log_dir = WORKSPACE / "dash_logs"
+                log_dir.mkdir(exist_ok=True)
+                log = open(log_dir / f"{name}.log", "ab")
+            else:
+                log = open(Path(agent["home"]).parent / "dashboard.log", "ab")
             proc = subprocess.Popen(
                 [str(HERMES_BIN), "dashboard", "--no-open", "--skip-build",
                  "--isolated", "--host", "127.0.0.1", "--port", str(port)],
@@ -642,10 +1001,13 @@ def tail_log(name: str, lines: int = 120) -> str:
     reg = load_registry()
     agent = reg["agents"][name]
     if agent.get("external"):
-        r = subprocess.run(
-            ["journalctl", "--user", "-u", "hermes-gateway", "-n", str(lines),
-             "--no-pager", "-o", "cat"], capture_output=True, text=True)
-        return r.stdout
+        cmd = ["journalctl"]
+        if agent.get("scope", "user") != "system":
+            cmd.append("--user")
+        cmd += ["-u", agent.get("unit", "hermes-gateway.service"),
+                "-n", str(lines), "--no-pager", "-o", "cat"]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        return r.stdout or r.stderr
     log = _gateway_log(agent)
     if not log.exists():
         return ""
@@ -659,10 +1021,14 @@ def list_subagents(name: str) -> List[Dict[str, Any]]:
     reg = load_registry()
     agent = reg["agents"][name]
     profiles_dir = Path(agent["home"]) / "profiles"
+    # Profiles that run as their own adopted gateway are promoted to
+    # first-class agents — don't list them twice.
+    promoted = {str(Path(a["home"]).resolve())
+                for n, a in reg["agents"].items() if n != name}
     out = []
     if profiles_dir.is_dir():
         for p in sorted(profiles_dir.iterdir()):
-            if p.is_dir():
+            if p.is_dir() and str(p.resolve()) not in promoted:
                 soul = p / "SOUL.md"
                 out.append({
                     "name": p.name,
@@ -676,6 +1042,10 @@ def create_subagent(name: str, sub_name: str, description: str = "") -> Dict[str
         raise ValueError("Subagent name must be lowercase letters/digits/hyphens")
     reg = load_registry()
     agent = reg["agents"][name]
+    if agent.get("read_only"):
+        raise ValueError(
+            "This is an adopted pre-installed agent — the workspace won't "
+            "modify it; manage its profiles with the hermes CLI instead")
     r = subprocess.run(
         [str(HERMES_BIN), "profile", "create", sub_name, "--clone"],
         env=_agent_env(agent), capture_output=True, text=True, timeout=120,
@@ -691,6 +1061,10 @@ def create_subagent(name: str, sub_name: str, description: str = "") -> Dict[str
 def delete_subagent(name: str, sub_name: str) -> None:
     reg = load_registry()
     agent = reg["agents"][name]
+    if agent.get("read_only"):
+        raise ValueError(
+            "This is an adopted pre-installed agent — the workspace won't "
+            "modify it; manage its profiles with the hermes CLI instead")
     r = subprocess.run(
         [str(HERMES_BIN), "profile", "delete", sub_name],
         env=_agent_env(agent), input="y\n", capture_output=True, text=True, timeout=120,
@@ -698,6 +1072,139 @@ def delete_subagent(name: str, sub_name: str) -> None:
     prof_home = Path(agent["home"]) / "profiles" / sub_name
     if prof_home.exists():
         shutil.rmtree(prof_home, ignore_errors=True)
+
+
+# ─── shared skills propagation ───────────────────────────────────────────────
+#
+# Hermes gateways cache the skill index in-process and only invalidate it in
+# the process that created a skill. With a SHARED skills directory that means
+# every OTHER running gateway keeps a stale index until it restarts. The
+# watchdog watches the shared skills dir and, when it changes, gracefully
+# reloads running gateways: adopted ones via their unit's ExecReload (hermes's
+# own planned-restart signal), workspace ones via stop/start.
+
+_SKILLS_WATCH_PATH = WORKSPACE / "skills_watch.json"
+_SKILL_RELOAD_COOLDOWN = 600
+_last_skill_reload: Dict[str, float] = {}
+
+
+def _skills_manifest() -> str:
+    """Fingerprint of the shared resources gateways load at startup: the
+    skill index (SKILL.md files) and plugin code (*.py — deliberately not
+    plugin state files like state.json, which change constantly and don't
+    require a reload)."""
+    h = hashlib.sha1()
+    for d, pattern in ((SHARED_DIR / "skills", "SKILL.md"),
+                       (SHARED_DIR / "plugins", "*.py")):
+        if not d.is_dir():
+            continue
+        for p in sorted(d.rglob(pattern)):
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            h.update(f"{p}|{st.st_mtime_ns}|{st.st_size}\n".encode())
+    return h.hexdigest()
+
+
+def propagate_skill_changes() -> List[str]:
+    state = _load(_SKILLS_WATCH_PATH, {})
+    current = _skills_manifest()
+    if state.get("manifest") == current:
+        return []
+    first_run = "manifest" not in state
+    _save(_SKILLS_WATCH_PATH, {"manifest": current, "changed_at": time.time()})
+    if first_run:                       # baseline only — nothing to propagate
+        return []
+    reloaded: List[str] = []
+    now = time.time()
+    for name, agent in load_registry()["agents"].items():
+        if not is_running(name):
+            continue
+        if now - _last_skill_reload.get(name, 0) < _SKILL_RELOAD_COOLDOWN:
+            continue
+        _last_skill_reload[name] = now
+        try:
+            if agent.get("external"):
+                _systemctl(agent, "reload")
+            else:
+                stop_agent(name)
+                start_agent(name)
+            reloaded.append(name)
+        except Exception:
+            pass
+    return reloaded
+
+
+# ─── shared CLI tools registry ───────────────────────────────────────────────
+#
+# The same concept as shared skills, for command-line tools: executables live
+# in shared/bin (already on every workspace agent's PATH via the home bin
+# symlink) and each tool is described by a markdown manifest in shared/clis/
+# (<name>.md: title, description paragraph, fenced command examples). Agents
+# register tools by simply writing those two files — the shared "cli-tools"
+# skill teaches them the convention — and the workspace UI's CLI tab and all
+# other agents see them immediately.
+
+def _parse_cli_manifest(text: str) -> Dict[str, str]:
+    """description = prose before the first ## heading; commands = fenced code."""
+    description: List[str] = []
+    commands: List[str] = []
+    in_fence = False
+    past_intro = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            commands.append(line)
+        elif stripped.startswith("##"):
+            past_intro = True
+        elif stripped and not stripped.startswith("#") and not past_intro:
+            description.append(stripped)
+    return {"description": " ".join(description),
+            "commands": "\n".join(commands)}
+
+
+def list_clis() -> List[Dict[str, Any]]:
+    clis_dir = SHARED_DIR / "clis"
+    bin_dir = SHARED_DIR / "bin"
+    out: List[Dict[str, Any]] = []
+    documented = set()
+    if clis_dir.is_dir():
+        for p in sorted(clis_dir.glob("*.md")):
+            try:
+                parsed = _parse_cli_manifest(p.read_text())
+            except OSError:
+                continue
+            documented.add(p.stem)
+            out.append({"name": p.stem, "documented": True, **parsed})
+    if bin_dir.is_dir():
+        for p in sorted(bin_dir.iterdir()):
+            if p.name not in documented and not p.name.startswith("."):
+                out.append({"name": p.name, "documented": False,
+                            "description": "binary in shared bin — no manifest yet",
+                            "commands": ""})
+    return out
+
+
+def create_cli(name: str, description: str, commands: str = "") -> Dict[str, Any]:
+    if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$", name):
+        raise ValueError("CLI name must be alphanumeric with ._- (max 64 chars)")
+    ensure_shared_seed()
+    body = f"# {name}\n\n{description.strip()}\n"
+    if commands.strip():
+        body += f"\n## Commands\n\n```\n{commands.strip()}\n```\n"
+    (SHARED_DIR / "clis" / f"{name}.md").write_text(body)
+    return {"name": name, "documented": True,
+            **_parse_cli_manifest(body)}
+
+
+def delete_cli(name: str) -> None:
+    path = SHARED_DIR / "clis" / f"{name}.md"
+    if path.is_file():
+        path.unlink()
 
 
 # ─── incidents + fixer ───────────────────────────────────────────────────────
@@ -746,8 +1253,12 @@ FIXER_PLAYBOOK = """You are the workspace Fixer. An incident occurred in another
 
 Workspace layout:
 - Root: {root}
-- Agent homes: {root}/agents/<name>/.hermes (main agent: {root}/hermes-home)
-- Gateway logs: {root}/agents/<name>/gateway.log (main: journalctl --user -u hermes-gateway)
+- Workspace agent homes: {root}/agents/<name>/.hermes
+- Gateway logs: {root}/agents/<name>/gateway.log
+- Adopted pre-installed agents (systemd-managed, e.g. ~/.hermes and its
+  profiles) are READ-ONLY: never edit their files, config, .env or memory.
+  For those, only use the orchestrator API restart endpoint (it restarts the
+  systemd unit) and journalctl for logs.
 - Orchestrator API (no auth, localhost): http://127.0.0.1:{port}/api/agents,
   POST /api/agents/<name>/restart, GET /api/agents/<name>/logs
 
@@ -827,6 +1338,8 @@ def _scan_log_errors(name: str, agent: Dict[str, Any]) -> Optional[str]:
 
 
 def _check_health(name: str, agent: Dict[str, Any]) -> bool:
+    if not agent.get("api_port"):
+        return False
     try:
         with urllib.request.urlopen(
                 f"http://127.0.0.1:{agent['api_port']}/health", timeout=5):
@@ -836,6 +1349,10 @@ def _check_health(name: str, agent: Dict[str, Any]) -> bool:
 
 
 def watchdog_tick() -> None:
+    try:
+        guard_adopted_units()
+    except Exception:
+        pass
     reg = load_registry()
     for name, agent in reg["agents"].items():
         managed = not agent.get("external")
@@ -868,8 +1385,9 @@ def watchdog_tick() -> None:
                 if inc:
                     dispatch_to_fixer(inc)
 
-        # 3. API health (only meaningful while running)
-        if is_running(name):
+        # 3. API health (only meaningful while running, and only for agents
+        # that actually expose an API server)
+        if agent.get("api_port") and is_running(name):
             if _check_health(name, agent):
                 _health_fails[name] = 0
             else:
@@ -894,6 +1412,10 @@ def start_watchdog(interval: int = 10) -> threading.Thread:
                 sync_shared()          # mtime-gated: no-op unless someone edited
             except Exception:
                 pass
+            try:
+                propagate_skill_changes()
+            except Exception:
+                pass
             time.sleep(interval)
     t = threading.Thread(target=_loop, daemon=True, name="watchdog")
     t.start()
@@ -908,7 +1430,11 @@ def agent_status(name: str) -> Dict[str, Any]:
     agent.pop("api_key", None)
     agent["name"] = name
     agent["running"] = is_running(name)
-    agent["healthy"] = agent["running"] and _check_health(name, reg["agents"][name])
+    # Agents without an API server (adopted profile gateways) can't be
+    # probed — running is the best signal we have.
+    agent["healthy"] = agent["running"] and (
+        _check_health(name, reg["agents"][name])
+        if agent.get("api_port") else True)
     agent["subagents"] = list_subagents(name)
     agent["dash_running"] = dash_is_running(name)
     return agent
@@ -916,16 +1442,25 @@ def agent_status(name: str) -> Dict[str, Any]:
 
 def graph() -> Dict[str, Any]:
     reg = load_registry()
+    homes = {str(Path(a["home"]).resolve()): n for n, a in reg["agents"].items()}
     nodes, edges = [], []
     for name in reg["agents"]:
         st = agent_status(name)
         nodes.append({
             "id": name, "type": "gateway", "running": st["running"],
             "healthy": st["healthy"], "port": st["api_port"],
+            "adopted": bool(st.get("adopted")),
             "description": st.get("description", ""),
         })
+        # Adopted profile gateways hang off the install they were cloned
+        # from: <main home>/profiles/<name>.
+        home = Path(reg["agents"][name]["home"]).resolve()
+        if st.get("adopted") and home.parent.name == "profiles":
+            parent = homes.get(str(home.parent.parent))
+            if parent:
+                edges.append({"from": parent, "to": name, "kind": "profile"})
         for sub in st["subagents"]:
             sid = f"{name}/{sub['name']}"
             nodes.append({"id": sid, "type": "subagent", "label": sub["name"]})
-            edges.append({"from": name, "to": sid})
+            edges.append({"from": name, "to": sid, "kind": "subagent"})
     return {"nodes": nodes, "edges": edges}

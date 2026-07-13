@@ -31,6 +31,7 @@ main { padding: 24px; max-width: 1200px; margin: 0 auto; }
 .badge { display: inline-block; font-size: 11px; padding: 1px 8px; border-radius: 10px;
   border: 1px solid var(--border); color: var(--muted); margin-right: 6px; }
 .badge.fixer { border-color: var(--accent); color: var(--accent); }
+.badge.installed { border-color: var(--blue); color: var(--blue); }
 .row { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
 button.act { background: var(--bg); color: var(--text); border: 1px solid var(--border);
   padding: 4px 10px; border-radius: 6px; cursor: pointer; font-size: 12px; }
@@ -51,8 +52,19 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; }
 td.detail { font: 11px/1.4 ui-monospace, monospace; color: var(--muted);
   max-width: 480px; overflow: hidden; }
 .kind-crash { color: var(--red); } .kind-log_error { color: var(--amber); } .kind-health { color: var(--blue); }
-#graph-svg { width: 100%; min-height: 480px; background: var(--panel);
-  border: 1px solid var(--border); border-radius: 8px; }
+#graph-wrap { position: relative; }
+#graph-svg { width: 100%; height: calc(100vh - 160px); min-height: 480px; display: block;
+  border: 1px solid var(--border); border-radius: 12px; cursor: grab; touch-action: none;
+  user-select: none; -webkit-user-select: none; }
+#graph-svg:active { cursor: grabbing; }
+#graph-toolbar { position: absolute; top: 14px; left: 14px; z-index: 2; display: flex;
+  gap: 8px; align-items: center; background: rgba(13,17,23,.72); backdrop-filter: blur(6px);
+  border: 1px solid var(--border); border-radius: 10px; padding: 8px 12px; }
+#graph-toolbar .hint { color: var(--muted); font-size: 11px; }
+.gnode { cursor: pointer; }
+.gnode:hover rect:first-of-type { stroke: var(--accent); }
+@keyframes gpulse { 0%,100% { opacity: 1; r: 5; } 50% { opacity: .55; r: 6.5; } }
+.pulse { animation: gpulse 2.2s ease-in-out infinite; }
 .modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: flex;
   align-items: center; justify-content: center; z-index: 10; }
 .modal { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
@@ -77,6 +89,7 @@ a { color: var(--blue); }
     <button data-view="agents" class="active">Agents</button>
     <button data-view="graph">Graph</button>
     <button data-view="shared">Shared</button>
+    <button data-view="clis">CLI Tools</button>
     <button data-view="incidents">Incidents</button>
   </nav>
 </header>

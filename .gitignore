@@ -8,6 +8,13 @@ workspace/__pycache__/
 workspace/*.log
 workspace/*.json
 workspace/shared/
+workspace/auth_secret
+workspace/dash_logs/
+workspace/dash_cache/
+workspace/unit_snapshots/
+
+# Installer-created virtualenv
+.venv/
 
 # Python cache
 **/__pycache__/

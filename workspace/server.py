@@ -1,24 +1,50 @@
 """Workspace UI server — FastAPI wrapper around the orchestrator.
 
-Run with the hermes venv python:
+Run with any python that has fastapi/uvicorn/pyyaml — the bundled
+hermes-venv if present, otherwise the machine's installed hermes venv:
     hermes-venv/bin/python workspace/server.py
+    /usr/local/lib/hermes-agent/venv/bin/python workspace/server.py
 Binds 127.0.0.1:9100.
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import orchestrator as orc
+from auth import AuthGate
+from proxy import DashboardProxy, agent_for_host
 
 app = FastAPI(title="AI Agents Workspace")
 STATIC = Path(__file__).parent / "static"
+
+# Public domain the workspace is served under (e.g. orchestrator.kundlas.com).
+# When set, agent dashboards are exposed at https://<agent>.<domain>/ through
+# the DashboardProxy middleware; when unset (local machine), dashboards are
+# opened directly on their 127.0.0.1 ports.
+DOMAIN = os.environ.get("WORKSPACE_DOMAIN", "").strip().lower().rstrip(".")
+
+
+def _password() -> str:
+    """Workspace password: WORKSPACE_PASSWORD, or WORKSPACE_PASSWORD_FILE.
+    Empty → authentication disabled (local mode)."""
+    pw = os.environ.get("WORKSPACE_PASSWORD", "").strip()
+    if pw:
+        return pw
+    pw_file = os.environ.get("WORKSPACE_PASSWORD_FILE", "").strip()
+    if pw_file:
+        try:
+            return Path(pw_file).read_text().strip()
+        except OSError:
+            pass
+    return ""
 
 
 class AgentCreate(BaseModel):
@@ -30,6 +56,12 @@ class AgentCreate(BaseModel):
 class SubagentCreate(BaseModel):
     name: str
     description: str = ""
+
+
+class CliCreate(BaseModel):
+    name: str
+    description: str
+    commands: str = ""
 
 
 @app.get("/api/agents")
@@ -89,9 +121,26 @@ def api_logs(name: str, lines: int = 120):
 def api_dashboard(name: str):
     _require(name)
     try:
-        return {"url": orc.start_dashboard(name)}
+        url = orc.start_dashboard(name)
     except ValueError as exc:
         raise HTTPException(409, str(exc))
+    if DOMAIN:
+        # One fixed dashboard hostname for all agents (no per-agent certs):
+        # /a/<name> pins the selection, then the SPA runs at the root.
+        url = f"https://dash.{DOMAIN}/a/{name}"
+    return {"url": url}
+
+
+@app.get("/api/tls-check")
+def api_tls_check(domain: str = ""):
+    """Caddy on_demand_tls 'ask' endpoint (kept for setups that still use
+    per-agent subdomains): approve the workspace domain, the dash host, and
+    <agent>.<domain> hosts that actually exist."""
+    d = domain.strip().lower().rstrip(".")
+    if DOMAIN and (d == DOMAIN or d == f"dash.{DOMAIN}"
+                   or agent_for_host(d, DOMAIN)):
+        return {"ok": True}
+    return Response(status_code=403)
 
 
 @app.get("/api/agents/{name}/subagents")
@@ -112,7 +161,10 @@ def api_create_subagent(name: str, body: SubagentCreate):
 @app.delete("/api/agents/{name}/subagents/{sub}")
 def api_delete_subagent(name: str, sub: str):
     _require(name)
-    orc.delete_subagent(name, sub)
+    try:
+        orc.delete_subagent(name, sub)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
     return {"ok": True}
 
 
@@ -129,6 +181,25 @@ def api_incidents(limit: int = 100):
 @app.get("/api/shared")
 def api_shared():
     return orc.shared_summary()
+
+
+@app.get("/api/clis")
+def api_clis():
+    return orc.list_clis()
+
+
+@app.post("/api/clis")
+def api_create_cli(body: CliCreate):
+    try:
+        return orc.create_cli(body.name, body.description, body.commands)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.delete("/api/clis/{name}")
+def api_delete_cli(name: str):
+    orc.delete_cli(name)
+    return {"ok": True}
 
 
 @app.post("/api/sync")
@@ -152,7 +223,19 @@ app.mount("/static", StaticFiles(directory=STATIC), name="static")
 def bootstrap() -> None:
     orc.AGENTS_DIR.mkdir(exist_ok=True)
     orc.ensure_shared_seed()
-    orc.register_main()
+    # Discover pre-installed Hermes gateways (systemd) and adopt them
+    # read-only; the main install seeds shared auth/skills/memories/CLIs.
+    try:
+        adopted = orc.adopt_installed()
+        if adopted:
+            print(f"Adopted installed gateways: {', '.join(adopted)}")
+        orc.guard_adopted_units()      # snapshot units before anything starts
+    except Exception as exc:
+        print(f"Install discovery skipped: {exc}")
+    try:
+        orc.sync_shared(restart_changed=False)     # adopt current state first
+    except Exception:
+        pass
     reg = orc.load_registry()
     if "fixer" not in reg["agents"]:
         orc.create_agent(
@@ -160,10 +243,6 @@ def bootstrap() -> None:
             "Repairs other agents automatically when the watchdog reports an incident",
             soul=(Path(__file__).parent / "fixer_soul.md").read_text(),
         )
-    try:
-        orc.sync_shared(restart_changed=False)     # adopt current state first
-    except Exception:
-        pass
     for name, agent in orc.load_registry()["agents"].items():
         # should_run reflects the user's last start/stop choice and outlives
         # orchestrator restarts; autostart only applies to never-started agents.
@@ -178,4 +257,9 @@ def bootstrap() -> None:
 
 if __name__ == "__main__":
     bootstrap()
-    uvicorn.run(app, host="127.0.0.1", port=orc.WORKSPACE_PORT, log_level="warning")
+    # AuthGate is outermost so one session cookie (issued for the parent
+    # domain) protects the workspace AND every agent dashboard subdomain.
+    stack = AuthGate(DashboardProxy(app, DOMAIN), _password(), DOMAIN,
+                     Path(__file__).parent)
+    uvicorn.run(stack, host="127.0.0.1", port=orc.WORKSPACE_PORT,
+                log_level="warning")
