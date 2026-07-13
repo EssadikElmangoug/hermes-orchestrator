@@ -1,0 +1,16 @@
+name: Feature request
+description: Propose an improvement to the workspace
+labels: [enhancement]
+body:
+  - type: textarea
+    attributes:
+      label: What problem would this solve?
+      description: Describe the situation where you needed this.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Proposed behavior
+      description: What should the workspace do? Note that features must preserve the read-only guarantee for adopted Hermes installs.
+    validations:
+      required: true

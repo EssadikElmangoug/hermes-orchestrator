@@ -1,0 +1,23 @@
+name: Bug report
+description: Something in the workspace, sync, proxy, or installer misbehaves
+labels: [bug]
+body:
+  - type: textarea
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Environment
+      description: OS, Python version, Hermes Agent version (`hermes --version`), and whether you use local or domain mode.
+      placeholder: |
+        Ubuntu 24.04 · Python 3.12 · Hermes Agent v0.18.0 · domain mode behind Caddy
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Logs
+      description: "Relevant output from: journalctl --user -u hermes-orchestrator -n 100"
+      render: text

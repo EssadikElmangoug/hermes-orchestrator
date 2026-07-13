@@ -1,8 +1,15 @@
 # Hermes Orchestrator
 
-Run a **fleet of [Hermes Agents](https://github.com/NousResearch/Hermes-Agent)** from one place — create agents, share everything between them, watch them, and let them repair each other.
+[![CI](https://github.com/EssadikElmangoug/hermes-orchestrator/actions/workflows/ci.yml/badge.svg)](https://github.com/EssadikElmangoug/hermes-orchestrator/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Built on top of Hermes Agent, without ever modifying it.
+Run a **fleet of [Hermes Agents](https://github.com/NousResearch/Hermes-Agent)** from one place — and let them work as a team:
+
+- **Shared everything** — a skill, plugin, CLI tool, MCP server, or login added by *any* agent (or by you) is instantly usable by *every* agent. Running agents reload automatically.
+- **Self-healing** — crashes and failing health checks are dispatched to a dedicated *fixer* agent that investigates and repairs the others.
+- **Adopts your existing install, read-only** — if the machine already runs Hermes, the workspace manages it alongside the fleet but **never writes into it**. A watchdog even restores its systemd units if anything clobbers them.
+
+![Demo — fleet view, graph, shared resources, and the cross-provider model picker](docs/demo.gif)
 
 ## Install
 
@@ -84,3 +91,9 @@ Requires `git`, Python 3.10+, and [Hermes Agent](https://hermes-agent.nousresear
 - Adopted agents are **never** written to — not their home, config, `.env`, memory, or profiles — and cannot be deleted from the workspace.
 - Their reusable resources (logins, skills, plugins, tools, webhooks) are **copied** into the shared layer, never moved.
 - A watchdog snapshots adopted systemd unit files and restores them if any process rewrites them to point at the wrong home.
+
+## Learn more
+
+- [Architecture](docs/architecture.md) — how the sync, watchdog, fixer, and dashboard proxy fit together
+- [Security](SECURITY.md) — network exposure, auth, secrets handling, blast-radius containment
+- [Contributing](CONTRIBUTING.md) — code map and the rules that matter

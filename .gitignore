@@ -3,6 +3,9 @@ hermes-venv/
 hermes-home/
 agents/
 
+# Local Hermes Agent source checkout (installed separately — see install.sh)
+hermes-agent-main/
+
 # Workspace runtime state
 workspace/__pycache__/
 workspace/*.log
