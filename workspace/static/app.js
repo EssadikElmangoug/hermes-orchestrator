@@ -1,4 +1,4 @@
-/* AI Agents Workspace UI — no build step, plain JS. */
+/* Hermes Orchestrator UI — no build step, plain JS. */
 "use strict";
 
 const $main = document.getElementById("main");

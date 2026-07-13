@@ -22,7 +22,7 @@ import orchestrator as orc
 from auth import AuthGate
 from proxy import DashboardProxy, agent_for_host
 
-app = FastAPI(title="AI Agents Workspace")
+app = FastAPI(title="Hermes Orchestrator")
 STATIC = Path(__file__).parent / "static"
 
 # Public domain the workspace is served under (e.g. orchestrator.kundlas.com).

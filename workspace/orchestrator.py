@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 
-ROOT = Path(__file__).resolve().parent.parent          # ai agents workplace/
+ROOT = Path(__file__).resolve().parent.parent          # hermes-orchestrator/
 WORKSPACE = ROOT / "workspace"
 AGENTS_DIR = ROOT / "agents"
 SHARED_DIR = WORKSPACE / "shared"

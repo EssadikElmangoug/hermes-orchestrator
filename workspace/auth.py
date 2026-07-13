@@ -207,7 +207,7 @@ async def _respond(send, status: int, body: bytes, headers):
 def _login_page(next_url: str, error: bool = False) -> str:
     return f"""<!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Agents Workspace — Sign in</title><style>
+<title>Hermes Orchestrator — Sign in</title><style>
 body {{ background:#0d1117; color:#e6edf3; font:14px/1.5 system-ui,sans-serif;
   display:flex; align-items:center; justify-content:center; min-height:100vh; margin:0 }}
 .box {{ background:#161b22; border:1px solid #30363d; border-radius:10px;
@@ -222,7 +222,7 @@ button {{ width:100%; margin-top:12px; background:#0d1117; color:#d4a017;
   border:1px solid #d4a017; padding:10px; border-radius:6px; font-size:14px; cursor:pointer }}
 .err {{ color:#f85149; font-size:12px; margin-top:10px }}
 </style></head><body><form class="box" method="post" action="/login">
-<h1>☤ Agents Workspace</h1>
+<h1>☤ Hermes Orchestrator</h1>
 <p>One sign-in covers the workspace and every agent dashboard.</p>
 <input type="password" name="password" placeholder="Password" autofocus autocomplete="current-password">
 <input type="hidden" name="next" value="{html.escape(next_url, quote=True)}">
