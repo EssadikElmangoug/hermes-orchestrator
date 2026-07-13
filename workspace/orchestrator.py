@@ -554,6 +554,117 @@ def _apply_shared_config(home: Path, shared_cfg: Dict[str, Any]) -> bool:
     return False
 
 
+# ─── workspace self-documentation ────────────────────────────────────────────
+#
+# Agents can only use the shared-resources feature reliably if it is part of
+# their knowledge: a repo-bundled skill (seeded into shared/skills and kept in
+# sync — the repo is its source of truth), a managed section inside the shared
+# hermes-agent skill (which agents consult whenever they reason about Hermes
+# itself), and a managed identity block in every workspace agent's SOUL.md.
+# All three refresh continuously, so fresh installs and existing fleets get
+# them without any manual step.
+
+SEED_SKILLS_DIR = WORKSPACE / "seed_skills"
+_DOC_BLOCK_BEGIN = "<!-- >>> hermes-orchestrator workspace (managed block — edits inside are overwritten) >>> -->"
+_DOC_BLOCK_END = "<!-- <<< hermes-orchestrator workspace <<< -->"
+
+_HERMES_AGENT_SKILL_NOTE = """
+## This machine: Hermes Orchestrator workspace — resources are FLEET-SHARED
+
+This Hermes instance is one agent in a fleet managed by Hermes Orchestrator.
+The fleet has a single shared resource layer: skills, plugins, CLI tools
+(`$HERMES_HOME/bin` + `$HERMES_HOME/clis`), memories, webhook routes, MCP
+servers, API keys (`.env`), model config, and provider logins are shared
+between ALL agents automatically. Your `$HERMES_HOME/skills`, `plugins`,
+`bin`, `clis`, and `memories` directories ARE the shared layer.
+
+Practical consequences:
+
+- Anything you save to those directories is instantly available to every
+  other agent; running agents auto-reload when shared skills/plugins change.
+- Install CLI tools by placing the executable in `$HERMES_HOME/bin/` (already
+  on every agent's PATH) with a manifest in `$HERMES_HOME/clis/<name>.md` —
+  NEVER via `pip install --user` / `npm install -g` (your HOME is private, so
+  those installs are invisible to other agents).
+- Config edits (`mcp_servers`, `.env` keys, `model`) propagate to the whole
+  fleet within ~10 seconds via the workspace sync.
+- Channel bindings (Telegram/WhatsApp/…), the dashboard section, and API
+  server identity always stay per-agent and are never shared.
+- The machine's pre-installed Hermes agent and its systemd units are
+  READ-ONLY to this workspace — never modify them.
+
+Read the `shared-resources` skill (workspace category) for full details, and
+the `cli-tools` skill for the CLI manifest format.
+""".strip()
+
+_SOUL_NOTE = """
+## Workspace context (Hermes Orchestrator fleet)
+
+You are one agent in a fleet managed by Hermes Orchestrator. Reusable
+resources are SHARED with every other agent: whatever you save under
+`$HERMES_HOME/skills/<category>/<name>/`, `$HERMES_HOME/plugins/<name>/`,
+`$HERMES_HOME/bin/` (+ manifest in `$HERMES_HOME/clis/<name>.md`), or
+`$HERMES_HOME/memories/` is instantly available fleet-wide, and MCP servers,
+API keys, and model config you set sync to all agents within seconds. Install
+CLI tools into `$HERMES_HOME/bin/` — never `pip install --user` or
+`npm install -g`, which are invisible to other agents. Before installing or
+creating shared things, consult the `shared-resources` skill. A dedicated
+`fixer` agent automatically receives incident reports and repairs broken
+agents in this fleet. Never modify the machine's pre-installed Hermes agent
+or its systemd units — it is read-only to this workspace.
+""".strip()
+
+
+def _upsert_marked_block(path: Path, content: str) -> bool:
+    """Insert or refresh the managed workspace block at the end of a markdown
+    file; creates the file if missing. Returns True when the file changed."""
+    block = f"{_DOC_BLOCK_BEGIN}\n{content}\n{_DOC_BLOCK_END}"
+    try:
+        text = path.read_text()
+    except OSError:
+        text = ""
+    if _DOC_BLOCK_BEGIN in text and _DOC_BLOCK_END in text:
+        pre = text.split(_DOC_BLOCK_BEGIN)[0]
+        post = text.split(_DOC_BLOCK_END, 1)[1]
+        new = pre.rstrip() + ("\n\n" if pre.strip() else "") + block + post
+    else:
+        new = (text.rstrip() + "\n\n" if text.strip() else "") + block + "\n"
+    if new != text:
+        try:
+            path.write_text(new)
+        except OSError:
+            return False
+        return True
+    return False
+
+
+def seed_workspace_docs() -> List[str]:
+    """Sync the repo-bundled workspace skills into shared/skills (unlike
+    agent-created resources, the REPO is their source of truth, so changed
+    files are overwritten) and refresh the managed workspace section in the
+    shared hermes-agent skill."""
+    changed: List[str] = []
+    if SEED_SKILLS_DIR.is_dir():
+        for src in SEED_SKILLS_DIR.rglob("*"):
+            if not src.is_file():
+                continue
+            rel = src.relative_to(SEED_SKILLS_DIR)
+            dst = SHARED_DIR / "skills" / rel
+            try:
+                if not dst.exists() or dst.read_bytes() != src.read_bytes():
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dst)
+                    changed.append(f"skills/{rel}")
+            except OSError:
+                pass
+    hermes_skill = (SHARED_DIR / "skills" / "autonomous-ai-agents"
+                    / "hermes-agent" / "SKILL.md")
+    if hermes_skill.is_file() and _upsert_marked_block(
+            hermes_skill, _HERMES_AGENT_SKILL_NOTE):
+        changed.append("hermes-agent/SKILL.md (workspace section)")
+    return changed
+
+
 def _merge_cfg_edits(prev: Dict[str, Any], view: Dict[str, Any],
                      out: Dict[str, Any]) -> None:
     """Fold one editor's config changes (its view vs the previous canonical
@@ -606,6 +717,10 @@ def sync_shared(restart_changed: bool = True, force: bool = False) -> Dict[str, 
     """
     with _lock:
         reg = load_registry()
+        try:
+            seed_workspace_docs()      # cheap no-op unless repo docs changed
+        except Exception:
+            pass
         state = _load(SHARED_STATE_PATH, {"config": {}, "env": {}, "mtimes": {}})
         prev_cfg: Dict[str, Any] = state["config"]
         prev_env: Dict[str, str] = state["env"]
@@ -669,6 +784,9 @@ def sync_shared(restart_changed: bool = True, force: bool = False) -> Dict[str, 
             changed = _ensure_shared_links(home)
             changed |= _apply_shared_config(home, new_cfg)
             changed |= _apply_env_block(home / ".env", env_lines)
+            # Every workspace agent's soul carries the fleet/shared-resources
+            # context — refreshed here so wording updates reach existing agents.
+            changed |= _upsert_marked_block(home / "SOUL.md", _SOUL_NOTE)
             mtimes[name] = {"cfg": _file_mtime(home / "config.yaml"),
                             "env": _file_mtime(home / ".env")}
             if changed:
@@ -758,6 +876,7 @@ def create_agent(name: str, description: str = "", soul: str = "") -> Dict[str, 
 
         if soul or description:
             (home / "SOUL.md").write_text(soul or f"# {name}\n\n{description}\n")
+        _upsert_marked_block(home / "SOUL.md", _SOUL_NOTE)
 
         reg["agents"][name] = {
             "home": str(home),
