@@ -1184,8 +1184,109 @@ def dash_is_running(name: str) -> bool:
     return bool(pid and _pid_is_dashboard(pid, agent["home"]))
 
 
+def dash_proc_died(name: str) -> bool:
+    """True only when a dashboard process spawned by THIS run has exited.
+
+    Positive evidence only: adopted/external dashboards (no Popen handle)
+    return False rather than guessing from a closed port."""
+    proc = _dash_procs.get(name)
+    return proc is not None and proc.poll() is not None
+
+
+def dash_log_tail(name: str, lines: int = 12) -> str:
+    reg = load_registry()
+    agent = reg["agents"].get(name)
+    if not agent:
+        return ""
+    if agent.get("read_only"):
+        log = WORKSPACE / "dash_logs" / f"{name}.log"
+    else:
+        log = Path(agent["home"]).parent / "dashboard.log"
+    try:
+        text = log.read_text(errors="replace")
+    except OSError:
+        return ""
+    return "\n".join(text.splitlines()[-lines:])
+
+
+_web_dist_dir: Optional[Path] = None    # resolved <hermes>/hermes_cli/web_dist
+_web_build_agent: Optional[str] = None  # agent whose dashboard runs the one-time UI build
+
+
+def _hermes_python() -> Optional[Path]:
+    """Python interpreter of the hermes install (its venv's python).
+
+    HERMES_BIN may be the venv console script itself, or the official
+    installer's /usr/local/bin/hermes bash wrapper (exec ".../venv/bin/hermes")
+    — follow both shapes to the venv."""
+    reals = [HERMES_BIN]
+    try:
+        text = HERMES_BIN.read_text(errors="ignore")
+    except OSError:
+        text = ""
+    m = re.search(r'^exec "([^"]+)"', text, re.M)
+    if m and Path(m.group(1)).exists():
+        reals.insert(0, Path(m.group(1)).resolve())
+    for real in reals:
+        for py in (real.parent / "python", real.parent / "python3"):
+            if py.exists():
+                return py
+    m = re.match(r"#!\s*(\S*python\S*)", text)
+    if m and Path(m.group(1)).exists():
+        return Path(m.group(1))
+    return None
+
+
+def _resolve_web_dist() -> Optional[Path]:
+    """The dist directory ``hermes dashboard --skip-build`` serves.
+
+    hermes_cli/web_dist is git-ignored upstream and only produced by an npm
+    build, so a fresh source install doesn't have it — there --skip-build
+    makes the dashboard exit immediately with "no web dist found"."""
+    global _web_dist_dir
+    if _web_dist_dir is not None:
+        return _web_dist_dir
+    if os.environ.get("HERMES_WEB_DIST"):
+        _web_dist_dir = Path(os.environ["HERMES_WEB_DIST"])
+        return _web_dist_dir
+    py = _hermes_python()
+    if py is not None:
+        try:
+            out = subprocess.run(
+                [str(py), "-c",
+                 "import hermes_cli, pathlib; "
+                 "print(pathlib.Path(hermes_cli.__file__).resolve().parent"
+                 " / 'web_dist')"],
+                capture_output=True, text=True, timeout=30)
+            if out.returncode == 0 and out.stdout.strip():
+                _web_dist_dir = Path(out.stdout.strip().splitlines()[-1])
+        except Exception:
+            pass
+    return _web_dist_dir
+
+
+def web_dist_ready() -> bool:
+    """True when the hermes install has a prebuilt dashboard web UI."""
+    dist = _resolve_web_dist()
+    # Unresolvable → assume ready (pre-existing behavior) rather than force
+    # every dashboard start through hermes's npm build check.
+    return dist is None or (dist / "index.html").exists()
+
+
+def web_build_active() -> bool:
+    """A one-time dashboard web-UI build is running somewhere in the fleet."""
+    return (not web_dist_ready()
+            and _web_build_agent is not None
+            and dash_is_running(_web_build_agent))
+
+
+class WebBuildInProgress(ValueError):
+    """Another agent's dashboard is running the one-time web-UI build."""
+
+
 def start_dashboard(name: str) -> str:
     """Spawn (or reuse) this agent's full native Hermes dashboard."""
+    global _web_build_agent
     with _lock:
         reg = load_registry()
         agent = reg["agents"][name]
@@ -1200,7 +1301,15 @@ def start_dashboard(name: str) -> str:
             raise ValueError(
                 f"Agent '{name}' is stopped — start it before opening its dashboard"
             )
+        skip_build = web_dist_ready()
         if not dash_is_running(name):
+            if not skip_build:
+                if web_build_active() and _web_build_agent != name:
+                    # npm builds in the shared hermes web dir must not race.
+                    raise WebBuildInProgress(
+                        "the dashboard web UI is still being built (first "
+                        "dashboard start on this machine) — retry in a few minutes")
+                _web_build_agent = name
             if agent.get("read_only"):
                 # Never write anything into an adopted install's directory —
                 # even a log file. Keep it in the workspace instead.
@@ -1209,15 +1318,28 @@ def start_dashboard(name: str) -> str:
                 log = open(log_dir / f"{name}.log", "ab")
             else:
                 log = open(Path(agent["home"]).parent / "dashboard.log", "ab")
+            cmd = [str(HERMES_BIN), "dashboard", "--no-open", "--isolated",
+                   "--host", "127.0.0.1", "--port", str(port)]
+            if skip_build:
+                # Fast path: serve the prebuilt UI. A fresh install has no
+                # dist yet — there the flag would make the dashboard exit
+                # with "no web dist found", so it is dropped and hermes
+                # builds the UI (npm) during this first start instead.
+                cmd.insert(2, "--skip-build")
             proc = subprocess.Popen(
-                [str(HERMES_BIN), "dashboard", "--no-open", "--skip-build",
-                 "--isolated", "--host", "127.0.0.1", "--port", str(port)],
+                cmd,
                 env=_agent_env(agent), stdout=log, stderr=log,
                 cwd=agent["home"], start_new_session=True,
             )
             _dash_procs[name] = proc
             agent["dash_pid"] = proc.pid
             save_registry(reg)
+        elif not skip_build:
+            # Dist still missing but this agent's dashboard process is alive:
+            # it is the one running the first-start build (e.g. re-adopted
+            # after a workspace restart) — re-learn that so callers can keep
+            # reporting "building" instead of a timeout.
+            _web_build_agent = name
         return f"http://127.0.0.1:{port}"
 
 

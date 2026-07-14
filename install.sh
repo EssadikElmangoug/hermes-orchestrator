@@ -43,6 +43,32 @@ main() {
     say "Found existing Hermes Agent: $(command -v hermes)"
   fi
 
+  # ── 1.5 Dashboard web UI ───────────────────────────────────────────────
+  # Agent dashboards serve hermes's prebuilt web UI (hermes_cli/web_dist).
+  # That directory is git-ignored upstream and only exists after an npm
+  # build, so a fresh hermes install doesn't have it — build it once now.
+  # Best-effort: if this fails (no npm, offline), the workspace builds it
+  # automatically on the first dashboard open instead.
+  HERMES_REAL="$(command -v hermes)"
+  # /usr/local/bin/hermes is a bash wrapper (exec ".../venv/bin/hermes") on
+  # official installs — follow it (and any symlink) to the venv.
+  WRAP_TARGET="$(sed -n 's/^exec "\([^"]*\)".*$/\1/p' "$HERMES_REAL" 2>/dev/null | head -1)"
+  [ -n "$WRAP_TARGET" ] && [ -e "$WRAP_TARGET" ] && HERMES_REAL="$WRAP_TARGET"
+  HERMES_REAL="$(readlink -f "$HERMES_REAL" 2>/dev/null || echo "$HERMES_REAL")"
+  HERMES_PY="$(dirname "$HERMES_REAL")/python"
+  [ -x "$HERMES_PY" ] || HERMES_PY="${HERMES_PY}3"
+  if [ -x "$HERMES_PY" ]; then
+    WEB_DIST_INDEX="$("$HERMES_PY" -c 'import hermes_cli, pathlib; print(pathlib.Path(hermes_cli.__file__).resolve().parent / "web_dist" / "index.html")' 2>/dev/null || true)"
+    if [ -n "$WEB_DIST_INDEX" ] && [ ! -f "$WEB_DIST_INDEX" ]; then
+      say "Building the Hermes dashboard web UI (one-time, a few minutes)…"
+      "$HERMES_PY" - <<'PYEOF' || say "Dashboard UI build failed — it will be built automatically on the first dashboard open."
+import sys
+from hermes_cli.main import _build_web_ui, PROJECT_ROOT
+sys.exit(0 if _build_web_ui(PROJECT_ROOT / "web", fatal=True) else 1)
+PYEOF
+    fi
+  fi
+
   # ── 2. Get the code ────────────────────────────────────────────────────
   if [ -d "$DEST/.git" ]; then
     say "Updating existing checkout at $DEST…"

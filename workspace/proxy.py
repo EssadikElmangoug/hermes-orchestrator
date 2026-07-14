@@ -14,6 +14,7 @@ on 127.0.0.1:<port> as before (local-machine mode).
 from __future__ import annotations
 
 import asyncio
+import html as _html
 import json
 import re
 import time
@@ -27,6 +28,7 @@ import yaml
 import orchestrator as orc
 
 _DASH_START_TIMEOUT = 25          # seconds to wait for a dashboard to come up
+_DASH_BUILDING = "__building__"   # sentinel err: one-time web-UI build running
 
 # Hop-by-hop / proxy-layer headers never forwarded to the dashboard. The
 # workspace's own Basic Auth (terminated at Caddy) is stripped too — the
@@ -520,6 +522,14 @@ class DashboardProxy:
             await receive()
             await send({"type": "websocket.close", "code": 1013})
             return
+        if err == _DASH_BUILDING:
+            await _send_html(
+                send, 503,
+                f"Building the dashboard web UI for <b>{name}</b> — a one-time"
+                " step on a fresh install that takes a few minutes."
+                "<br>This page refreshes automatically until it is ready.",
+                refresh=15)
+            return
         await _send_html(
             send, 503,
             f"Dashboard for <b>{name}</b> is not available: {err or 'not running'}."
@@ -536,18 +546,30 @@ def _ensure_dashboard(name: str) -> Tuple[Optional[int], str]:
         return port, ""
     try:
         orc.start_dashboard(name)
+    except orc.WebBuildInProgress:
+        return None, _DASH_BUILDING
     except (ValueError, KeyError) as exc:
         return None, str(exc)
     deadline = time.time() + _DASH_START_TIMEOUT
     while time.time() < deadline:
         if orc._port_open(port):
             return port, ""
+        if orc.dash_proc_died(name):
+            tail = orc.dash_log_tail(name)
+            return None, (
+                "its process exited during startup"
+                + (f":<br><pre style='white-space:pre-wrap;color:#f85149'>"
+                   f"{_html.escape(tail)}</pre>" if tail else ""))
         time.sleep(0.5)
+    if orc.web_build_active():
+        return None, _DASH_BUILDING
     return None, "dashboard did not come up in time"
 
 
-async def _send_html(send, status: int, message: str):
-    body = (f"<html><body style='font-family:system-ui;background:#0d1117;"
+async def _send_html(send, status: int, message: str, refresh: int = 0):
+    head = (f"<head><meta http-equiv='refresh' content='{refresh}'></head>"
+            if refresh else "")
+    body = (f"<html>{head}<body style='font-family:system-ui;background:#0d1117;"
             f"color:#e6edf3;padding:40px'>{message}</body></html>").encode()
     await send({"type": "http.response.start", "status": status,
                 "headers": [(b"content-type", b"text/html; charset=utf-8"),
