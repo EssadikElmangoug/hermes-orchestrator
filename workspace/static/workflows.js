@@ -65,7 +65,10 @@ function wfLabel(n) {
 }
 function wfSubLabel(n) {
   const c = n.config || {};
-  if (n.type === "step.agent") return c.title ? (c.agent || "agent") : "agent step";
+  if (n.type === "step.agent") {
+    const base = c.title ? (c.agent || "agent") : "agent step";
+    return c.model ? `${base} · ${c.model.split("/").pop()}` : base;
+  }
   if (n.type === "out.channel") return `via ${c.agent || "?"}`;
   if (wfIsCap(n.type)) return WF_TYPES[n.type].name;
   return WF_TYPES[n.type].sub || "";
@@ -917,8 +920,21 @@ function wfOpenDrawer(force) {
 
   if (n.type === "step.agent") {
     const agents = (wfRes.agents || []).filter(a => a.api);
+    const cur = agents.find(a => a.name === cfg.agent);
+    const models = wfRes.models || [];
+    const provs = [...new Set(models.map(m => m.provider))];
     fields += wfField("Agent", `<select data-k="agent">
         ${agents.map(a => `<option ${a.name === cfg.agent ? "selected" : ""}>${esc(a.name)}</option>`).join("")}
+      </select>`) +
+      wfField("Model for this step", `<select data-k="model">
+        <option value="">Agent default${cur && cur.model ? ` (${esc(cur.model)})` : ""}</option>
+        ${provs.map(p => {
+          const ms = models.filter(m => m.provider === p);
+          const ready = ms[0].ready;
+          return `<optgroup label="${esc(p)}${ready ? "" : " — no shared credentials"}">
+            ${ms.map(m => `<option value="${esc(m.id)}" ${m.id === cfg.model ? "selected" : ""}>${esc(m.model)}</option>`).join("")}
+          </optgroup>`;
+        }).join("")}
       </select>`) +
       wfField("Instruction", `<textarea data-k="instruction" rows="6"
         placeholder="What should this step do? Upstream outputs are attached automatically.">${esc(cfg.instruction || "")}</textarea>`) +
@@ -977,7 +993,8 @@ function wfOpenDrawer(force) {
     ${fields}
     ${nr && (nr.output || nr.error) ? `
       <label>Run ${nr.error ? "error" : "output"}
-        <span class="wf-out-pill" style="margin-left:6px">${esc(nr.status)}</span></label>
+        <span class="wf-out-pill" style="margin-left:6px">${esc(nr.status)}</span>
+        ${nr.model ? `<span class="wf-out-pill" style="margin-left:4px">${esc(nr.model)}</span>` : ""}</label>
       <pre>${esc(nr.error || nr.output)}</pre>` : ""}
     <label>&nbsp;</label>
     <button class="act danger" id="wf-del-node" style="width:100%">Delete node</button>`;

@@ -297,3 +297,70 @@ def test_builder_chat_bad_doc_reports(env, monkeypatch):
     # both attempts return the same invalid doc -> user gets the rejection
     assert "could not apply" in text.lower()
     assert len(wfl.load_workflow(wf["id"])["nodes"]) == 1     # unchanged
+
+
+# ─── per-node model overrides ────────────────────────────────────────────────
+
+def test_ensure_model_routes(env, tmp_path, monkeypatch):
+    home = tmp_path / "alpha"
+    home.mkdir(exist_ok=True)
+    (home / "provider_models_cache.json").write_text(json.dumps({
+        "anthropic": {"models": ["claude-fable-5", {"id": "claude-opus-4-8"}]},
+        "openrouter": {"models": ["meta/llama-4"]},
+    }))
+    (home / "config.yaml").write_text("model:\n  provider: anthropic\n  default: claude-opus-4-8\n")
+    assert orc.ensure_model_routes(home) is True
+    assert orc.ensure_model_routes(home) is False        # idempotent
+    import yaml
+    cfg = yaml.safe_load((home / "config.yaml").read_text())
+    routes = cfg["platforms"]["api_server"]["extra"]["model_routes"]
+    assert routes["anthropic/claude-fable-5"] == {"provider": "anthropic",
+                                                  "model": "claude-fable-5"}
+    # provider-prefixed ids are not double-prefixed
+    assert "openrouter/meta/llama-4" in routes
+    assert cfg["model"]["default"] == "claude-opus-4-8"  # rest untouched
+    assert orc.agent_default_model({"home": str(home)}) == "anthropic/claude-opus-4-8"
+
+
+def test_step_model_override(env, monkeypatch):
+    class Models(_StubHandler):
+        def do_GET(self):
+            payload = json.dumps({"data": [{"id": "hermes-agent"},
+                                           {"id": "anthropic/claude-fable-5"}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+    bodies = []
+    orig = _StubHandler.do_POST
+    def capture(self):
+        length = int(self.headers["Content-Length"])
+        raw = self.rfile.read(length)
+        bodies.append(json.loads(raw))
+        import io
+        self.rfile = io.BytesIO(raw)
+        self.headers.replace_header("Content-Length", str(length))
+        orig(self)
+    monkeypatch.setattr(_StubHandler, "do_GET", Models.do_GET, raising=False)
+    monkeypatch.setattr(_StubHandler, "do_POST", capture)
+
+    wf = wfl.create_workflow("modeled")
+    doc = wfl.load_workflow(wf["id"])
+    doc["nodes"].append({"id": "s1", "type": "step.agent",
+                         "config": {"agent": "alpha",
+                                    "model": "anthropic/claude-fable-5"}})
+    doc["edges"] = [{"from": "trigger", "to": "s1", "kind": "flow"}]
+    wfl.save_workflow(wf["id"], doc)
+    run = wfl.start_run(wf["id"])
+    run = _wait(run["id"], {"success"})
+    assert run["nodes"]["s1"]["model"] == "anthropic/claude-fable-5"
+    assert bodies[-1]["model"] == "anthropic/claude-fable-5"
+
+    # a model the agent doesn't route fails fast with a clear error
+    doc = wfl.load_workflow(wf["id"])
+    doc["nodes"][-1]["config"]["model"] = "gemini/gemini-2.5-pro"
+    wfl.save_workflow(wf["id"], doc)
+    run2 = wfl.start_run(wf["id"])
+    run2 = _wait(run2["id"], {"failed"})
+    assert "no model route" in run2["error"]

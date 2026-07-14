@@ -413,6 +413,82 @@ def adopt_installed() -> List[str]:
     return adopted
 
 
+# ─── model catalog + per-request model routes ────────────────────────────────
+
+_MODEL_CACHE_FILE = "provider_models_cache.json"
+
+
+def model_catalog() -> Dict[str, List[str]]:
+    """provider → sorted model ids, unioned from every agent home's model
+    picker cache (written by `hermes model`; strictly read-only here)."""
+    catalog: Dict[str, set] = {}
+    for agent in load_registry()["agents"].values():
+        try:
+            data = json.loads((Path(agent["home"]) / _MODEL_CACHE_FILE).read_text())
+        except Exception:
+            continue
+        for prov, entry in (data or {}).items():
+            models = entry.get("models") if isinstance(entry, dict) else None
+            for m in models or []:
+                mid = m if isinstance(m, str) else (m or {}).get("id")
+                if mid:
+                    catalog.setdefault(str(prov), set()).add(str(mid))
+    return {p: sorted(ms) for p, ms in sorted(catalog.items())}
+
+
+def build_model_routes() -> Dict[str, Dict[str, str]]:
+    """API-server model_routes covering the whole catalog: the alias a client
+    sends as the request's ``model`` field is ``provider/model``."""
+    routes: Dict[str, Dict[str, str]] = {}
+    for prov, models in model_catalog().items():
+        for mid in models:
+            alias = mid if mid.startswith(f"{prov}/") else f"{prov}/{mid}"
+            routes[alias] = {"provider": prov, "model": mid}
+    return routes
+
+
+def ensure_model_routes(home: Path) -> bool:
+    """Write ``platforms.api_server.extra.model_routes`` into an agent's
+    config.yaml so workflow steps can pick a model per node. The gateway
+    reads routes at startup — callers decide about restarts. Returns True
+    when the file changed."""
+    routes = build_model_routes()
+    if not routes:
+        return False
+    cfg_path = home / "config.yaml"
+    try:
+        cfg = yaml.safe_load(cfg_path.read_text()) or {}
+    except Exception:
+        cfg = {}
+    platforms = cfg.setdefault("platforms", {})
+    if not isinstance(platforms, dict):
+        return False                      # unexpected shape — leave untouched
+    api = platforms.setdefault("api_server", {})
+    if not isinstance(api, dict):
+        return False
+    extra = api.setdefault("extra", {})
+    if not isinstance(extra, dict):
+        return False
+    if extra.get("model_routes") == routes:
+        return False
+    extra["model_routes"] = routes
+    cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False))
+    return True
+
+
+def agent_default_model(agent: Dict[str, Any]) -> str:
+    """The agent's configured default, as 'provider/model' (best effort)."""
+    try:
+        cfg = yaml.safe_load((Path(agent["home"]) / "config.yaml").read_text()) or {}
+        m = cfg.get("model") or {}
+        if isinstance(m, dict) and m.get("default"):
+            prov = m.get("provider", "")
+            return f"{prov}/{m['default']}" if prov else str(m["default"])
+    except Exception:
+        pass
+    return ""
+
+
 # ─── agent lifecycle ─────────────────────────────────────────────────────────
 
 def _agent_env(agent: Dict[str, Any]) -> Dict[str, str]:
@@ -888,6 +964,10 @@ def create_agent(name: str, description: str = "", soul: str = "") -> Dict[str, 
         if soul or description:
             (home / "SOUL.md").write_text(soul or f"# {name}\n\n{description}\n")
         _upsert_marked_block(home / "SOUL.md", _SOUL_NOTE)
+        try:
+            ensure_model_routes(home)
+        except Exception:
+            pass
 
         reg["agents"][name] = {
             "home": str(home),
@@ -937,6 +1017,12 @@ def start_agent(name: str) -> None:
             agent["should_run"] = True
             save_registry(reg)
             return
+        # Refresh per-request model routes so workflow steps can pick any
+        # catalog model on this agent (gateway reads them at startup).
+        try:
+            ensure_model_routes(Path(agent["home"]))
+        except Exception:
+            pass
         log = open(_gateway_log(agent), "ab")
         # --force: Hermes refuses shell-started gateways while ANY systemd
         # hermes-gateway unit is active, but that guard protects a shared

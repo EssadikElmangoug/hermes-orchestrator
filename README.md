@@ -59,7 +59,11 @@ research skill attached) → writer agent → human approval → deliver to
 Telegram*. Steps run through each agent's OpenAI-compatible API server
 (enable with `API_SERVER_ENABLED=1` + `API_SERVER_PORT`/`KEY` in the agent's
 `.env` — workspace-created agents have it on by default), each step receiving
-the labeled outputs of its upstream steps. Runs show live on the canvas with
+the labeled outputs of its upstream steps. Every step can also pick its own
+**model** (`provider/model` from the fleet's model catalog — e.g. a cheap
+model for research, a top model for writing): the workspace auto-writes
+matching `model_routes` into workspace agents' API servers at start, and runs
+fail fast if a step requests a model its agent doesn't route. Runs show live on the canvas with
 per-node output, history, and resume-worthy approval gates; failures raise
 incidents that the fixer picks up like any other fleet problem.
 

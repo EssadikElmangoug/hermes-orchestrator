@@ -221,6 +221,38 @@ def agent_channels(agent: Dict[str, Any]) -> List[str]:
     return sorted(found)
 
 
+# Shared env keys that indicate a provider has credentials fleet-wide.
+_PROVIDER_ENV_HINTS = {
+    "anthropic": ("ANTHROPIC_API_KEY",),
+    "openai": ("OPENAI_API_KEY",),
+    "openrouter": ("OPENROUTER_API_KEY",),
+    "deepseek": ("DEEPSEEK_API_KEY",),
+    "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+    "groq": ("GROQ_API_KEY",),
+    "xai": ("XAI_API_KEY",),
+    "mistral": ("MISTRAL_API_KEY",),
+    "moonshot": ("MOONSHOT_API_KEY",),
+}
+
+
+def model_options(shared: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Flat model list for the UI/builder: id is the per-node 'model' value.
+    ``ready`` marks providers with fleet-wide credentials (OAuth in the
+    shared auth.json or an API key in the shared env)."""
+    authed = set(shared.get("providers") or [])
+    env_keys = set(shared.get("env_keys") or [])
+    out = []
+    for prov, models in orc.model_catalog().items():
+        ready = (prov in authed
+                 or any(k in env_keys for k in _PROVIDER_ENV_HINTS.get(prov, ())))
+        for mid in models:
+            alias = mid if mid.startswith(f"{prov}/") else f"{prov}/{mid}"
+            out.append({"id": alias, "provider": prov, "model": mid,
+                        "ready": ready})
+    out.sort(key=lambda m: (not m["ready"], m["id"]))
+    return out
+
+
 def resources() -> Dict[str, Any]:
     """Everything the palette can drag onto the canvas."""
     reg = orc.load_registry()
@@ -234,6 +266,7 @@ def resources() -> Dict[str, Any]:
             "description": agent.get("description", "")[:160],
             "api": has_api,
             "running": orc.is_running(name),
+            "model": orc.agent_default_model(agent),
         })
         if has_api:
             for ch in agent_channels(agent):
@@ -241,6 +274,7 @@ def resources() -> Dict[str, Any]:
     return {
         "agents": agents,
         "channels": channels,
+        "models": model_options(shared),
         "skills": shared["skills"],
         "clis": [t["name"] for t in orc.list_clis()],
         "mcp_servers": shared["mcp_servers"],
@@ -385,9 +419,11 @@ def _caps_for_step(doc: Dict[str, Any], step_id: str) -> List[Dict[str, Any]]:
 # ─── agent invocation ────────────────────────────────────────────────────────
 
 def _call_agent(agent: Dict[str, Any], prompt: str, session: str,
-                timeout: int = STEP_TIMEOUT) -> str:
+                timeout: int = STEP_TIMEOUT, model: Optional[str] = None) -> str:
     body = json.dumps({
-        "model": "hermes-agent",
+        # A "provider/model" value matching one of the agent's model_routes
+        # runs this request on that model; anything else uses its default.
+        "model": model or "hermes-agent",
         "messages": [{"role": "user", "content": prompt}],
     }).encode()
     req = urllib.request.Request(
@@ -402,6 +438,33 @@ def _call_agent(agent: Dict[str, Any], prompt: str, session: str,
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         data = json.loads(resp.read())
     return data["choices"][0]["message"]["content"]
+
+
+def _agent_model_aliases(agent: Dict[str, Any]) -> Optional[set]:
+    """Model aliases the agent's API server accepts (GET /v1/models), or
+    None when the list can't be fetched (callers then skip the check)."""
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{agent['api_port']}/v1/models",
+        headers={"Authorization": f"Bearer {agent['api_key']}"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        items = data.get("data") if isinstance(data, dict) else data
+        return {m.get("id") if isinstance(m, dict) else str(m) for m in items or []}
+    except Exception:
+        return None
+
+
+def _check_model(agent_name: str, agent: Dict[str, Any], model: str) -> None:
+    """Fail fast when a per-node model isn't routed on the agent — otherwise
+    the gateway silently ignores unknown model values and the step would run
+    on the default model while claiming otherwise."""
+    aliases = _agent_model_aliases(agent)
+    if aliases is not None and model not in aliases:
+        raise RuntimeError(
+            f'Agent "{agent_name}" has no model route for "{model}". Restart '
+            "the agent to refresh its routes (the workspace writes them at "
+            "start), or pick a model from the step's model list.")
 
 
 def _get_agent(name: str) -> Dict[str, Any]:
@@ -536,10 +599,14 @@ def _execute(wf: Dict[str, Any], run: Dict[str, Any], payload: str) -> None:
             elif node["type"] == "step.agent":
                 cfg = node.get("config", {})
                 agent = _get_agent(cfg.get("agent"))
+                model = (cfg.get("model") or "").strip() or None
+                if model:
+                    _check_model(cfg.get("agent"), agent, model)
+                    nr["model"] = model
                 caps = _caps_for_step(wf, node["id"])
                 prompt = _step_prompt(wf, node, inputs, caps)
                 session = f"wf-{wf['id']}-{run['id'][-10:]}-{node['id']}"
-                reply = _call_agent(agent, prompt, session)
+                reply = _call_agent(agent, prompt, session, model=model)
                 if cfg.get("output") == "json":
                     try:
                         json.loads(_strip_fences(reply))
@@ -548,7 +615,8 @@ def _execute(wf: Dict[str, Any], run: Dict[str, Any], payload: str) -> None:
                         reply = _call_agent(agent, prompt +
                             "\n\nYour previous reply was not valid JSON. "
                             "Reply again with ONLY the JSON object.\n"
-                            f"Previous reply:\n{reply[:4000]}", session)
+                            f"Previous reply:\n{reply[:4000]}", session,
+                            model=model)
                         reply = _strip_fences(reply)
                         json.loads(reply)      # raises → fail()
                 outputs[node["id"]] = reply

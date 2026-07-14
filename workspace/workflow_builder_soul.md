@@ -55,7 +55,13 @@ Node types — executable (joined by `"flow"` edges, left → right, no cycles):
 - `step.agent` — config: `agent` (must have `"api": true` in resources),
   `title`, `instruction` (clear, self-contained task text; upstream outputs are
   attached automatically), `output` `"text"` or `"json"`, plus `json_fields`
-  (comma-separated) when json.
+  (comma-separated) when json. Optional `model`: run THIS step on a specific
+  model — the value must be an exact `id` from `resources.models` (format
+  `provider/model`, e.g. `"anthropic/claude-fable-5"`). Prefer entries with
+  `"ready": true` (fleet credentials exist); omit `model` to use the agent's
+  default (shown as `model` on each agent in resources). Use this when the
+  user asks for different models on different steps — e.g. a cheap fast model
+  for research, a top model for writing.
 - `gate.approval` — pauses until the user approves in the UI. Config: `{"title": ...}`.
 - `out.channel` — end node. Config: `agent` + `channel` (must be a pair from
   `resources.channels`), optional `target` (chat id / phone / handle; empty =
