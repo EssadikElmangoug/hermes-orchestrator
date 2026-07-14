@@ -438,5 +438,8 @@ if __name__ == "__main__":
     # domain) protects the workspace AND every agent dashboard subdomain.
     stack = AuthGate(DashboardProxy(app, DOMAIN), _password(), DOMAIN,
                      Path(__file__).parent)
+    # Cap graceful shutdown: open websockets/long agent calls otherwise kept
+    # the old process alive until systemd's final SIGKILL swept the whole
+    # cgroup (taking the agent gateways with it).
     uvicorn.run(stack, host="127.0.0.1", port=orc.WORKSPACE_PORT,
-                log_level="warning")
+                log_level="warning", timeout_graceful_shutdown=5)

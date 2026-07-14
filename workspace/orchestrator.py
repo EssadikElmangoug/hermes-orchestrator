@@ -489,6 +489,52 @@ def agent_default_model(agent: Dict[str, Any]) -> str:
     return ""
 
 
+# ─── busy tracking — never restart an agent mid workflow step ────────────────
+
+_busy_agents: Dict[str, int] = {}
+_busy_lock = threading.Lock()
+_pending_restarts: set = set()
+
+
+def mark_agent_busy(name: str) -> None:
+    with _busy_lock:
+        _busy_agents[name] = _busy_agents.get(name, 0) + 1
+
+
+def unmark_agent_busy(name: str) -> None:
+    with _busy_lock:
+        left = _busy_agents.get(name, 0) - 1
+        if left <= 0:
+            _busy_agents.pop(name, None)
+        else:
+            _busy_agents[name] = left
+
+
+def agent_is_busy(name: str) -> bool:
+    with _busy_lock:
+        return _busy_agents.get(name, 0) > 0
+
+
+def _drain_pending_restarts(reg: Dict[str, Any]) -> None:
+    """Apply restarts that were deferred because the agent was mid-step."""
+    for name in list(_pending_restarts):
+        agent = reg["agents"].get(name)
+        if not agent:
+            _pending_restarts.discard(name)
+            continue
+        if agent_is_busy(name):
+            continue
+        _pending_restarts.discard(name)
+        try:
+            if agent.get("external"):
+                _systemctl(agent, "reload")
+            else:
+                stop_agent(name)
+                start_agent(name)
+        except Exception:
+            pass
+
+
 # ─── agent lifecycle ─────────────────────────────────────────────────────────
 
 def _agent_env(agent: Dict[str, Any]) -> Dict[str, str]:
@@ -881,9 +927,14 @@ def sync_shared(restart_changed: bool = True, force: bool = False) -> Dict[str, 
                 recently = time.time() - _last_sync_restart.get(name, 0) < 300
                 if restart_changed and is_running(name) and not recently:
                     _last_sync_restart[name] = time.time()
-                    stop_agent(name)
-                    start_agent(name)
-                    report["restarted"].append(name)
+                    if agent_is_busy(name):
+                        # mid workflow step — restart once it is idle
+                        _pending_restarts.add(name)
+                        report.setdefault("deferred", []).append(name)
+                    else:
+                        stop_agent(name)
+                        start_agent(name)
+                        report["restarted"].append(name)
 
         state.update({"config": new_cfg, "env": new_env, "mtimes": mtimes})
         _save(SHARED_STATE_PATH, state)
@@ -1339,6 +1390,10 @@ def propagate_skill_changes() -> List[str]:
             continue
         if now - _last_skill_reload.get(name, 0) < _SKILL_RELOAD_COOLDOWN:
             continue
+        if agent_is_busy(name):
+            # mid workflow step — reload once idle (cooldown not consumed)
+            _pending_restarts.add(name)
+            continue
         _last_skill_reload[name] = now
         try:
             if agent.get("external"):
@@ -1570,6 +1625,7 @@ def watchdog_tick() -> None:
     except Exception:
         pass
     reg = load_registry()
+    _drain_pending_restarts(reg)
     for name, agent in reg["agents"].items():
         managed = not agent.get("external")
 

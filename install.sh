@@ -107,6 +107,12 @@ ExecStart=$RUN_CMD
 WorkingDirectory=$DEST/workspace
 Restart=always
 RestartSec=5
+# The workspace spawns agent gateways as child processes. KillMode=process
+# stops only the workspace itself on restart/update — the gateways keep
+# running (the workspace re-attaches to them via the registry), instead of
+# being SIGKILLed mid-request with every service restart.
+KillMode=process
+TimeoutStopSec=15
 StandardOutput=journal
 StandardError=journal
 

@@ -364,3 +364,45 @@ def test_step_model_override(env, monkeypatch):
     run2 = wfl.start_run(wf["id"])
     run2 = _wait(run2["id"], {"failed"})
     assert "no model route" in run2["error"]
+
+
+# ─── busy tracking: agents are never restarted mid-step ─────────────────────
+
+def test_busy_primitives_and_deferred_restart(monkeypatch):
+    orc.mark_agent_busy("x"); orc.mark_agent_busy("x")
+    orc.unmark_agent_busy("x")
+    assert orc.agent_is_busy("x")          # nested marks
+    orc.unmark_agent_busy("x")
+    assert not orc.agent_is_busy("x")
+
+    calls = []
+    monkeypatch.setattr(orc, "stop_agent", lambda n: calls.append(("stop", n)))
+    monkeypatch.setattr(orc, "start_agent", lambda n: calls.append(("start", n)))
+    reg = {"agents": {"a": {"external": False}}}
+    orc.mark_agent_busy("a")
+    orc._pending_restarts.add("a")
+    orc._drain_pending_restarts(reg)
+    assert not calls and "a" in orc._pending_restarts   # deferred while busy
+    orc.unmark_agent_busy("a")
+    orc._drain_pending_restarts(reg)
+    assert calls == [("stop", "a"), ("start", "a")]
+    assert "a" not in orc._pending_restarts
+
+
+def test_step_marks_agent_busy(env, monkeypatch):
+    seen = []
+    mark, unmark = orc.mark_agent_busy, orc.unmark_agent_busy
+    monkeypatch.setattr(orc, "mark_agent_busy",
+                        lambda n: (seen.append(("+", n)), mark(n)))
+    monkeypatch.setattr(orc, "unmark_agent_busy",
+                        lambda n: (seen.append(("-", n)), unmark(n)))
+    wf = wfl.create_workflow("busy")
+    doc = wfl.load_workflow(wf["id"])
+    doc["nodes"].append({"id": "s1", "type": "step.agent",
+                         "config": {"agent": "alpha"}})
+    doc["edges"] = [{"from": "trigger", "to": "s1", "kind": "flow"}]
+    wfl.save_workflow(wf["id"], doc)
+    run = wfl.start_run(wf["id"])
+    _wait(run["id"], {"success"})
+    assert ("+", "alpha") in seen and ("-", "alpha") in seen
+    assert not orc.agent_is_busy("alpha")

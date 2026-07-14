@@ -32,6 +32,7 @@ import re
 import secrets
 import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -419,25 +420,47 @@ def _caps_for_step(doc: Dict[str, Any], step_id: str) -> List[Dict[str, Any]]:
 # ─── agent invocation ────────────────────────────────────────────────────────
 
 def _call_agent(agent: Dict[str, Any], prompt: str, session: str,
-                timeout: int = STEP_TIMEOUT, model: Optional[str] = None) -> str:
+                timeout: int = STEP_TIMEOUT, model: Optional[str] = None,
+                busy_name: Optional[str] = None) -> str:
     body = json.dumps({
         # A "provider/model" value matching one of the agent's model_routes
         # runs this request on that model; anything else uses its default.
         "model": model or "hermes-agent",
         "messages": [{"role": "user", "content": prompt}],
     }).encode()
-    req = urllib.request.Request(
-        f"http://127.0.0.1:{agent['api_port']}/v1/chat/completions",
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {agent['api_key']}",
-            "X-Hermes-Session-Id": session,
-        },
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        data = json.loads(resp.read())
-    return data["choices"][0]["message"]["content"]
+    # While the call is in flight the agent is marked busy so fleet-wide
+    # reloads (shared sync, skills propagation) defer instead of killing it
+    # mid-step — that produced "connection refused"/"remote end closed"
+    # step failures.
+    if busy_name:
+        orc.mark_agent_busy(busy_name)
+    try:
+        for attempt in (1, 2):
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{agent['api_port']}/v1/chat/completions",
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {agent['api_key']}",
+                    "X-Hermes-Session-Id": session,
+                },
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    data = json.loads(resp.read())
+                return data["choices"][0]["message"]["content"]
+            except urllib.error.URLError as exc:
+                # Connection refused = the request never reached the agent
+                # (it is restarting) — safe to retry once after a grace
+                # period. Anything else is ambiguous and must surface.
+                refused = isinstance(getattr(exc, "reason", None),
+                                     ConnectionRefusedError)
+                if not refused or attempt == 2:
+                    raise
+                time.sleep(20)
+    finally:
+        if busy_name:
+            orc.unmark_agent_busy(busy_name)
 
 
 def _agent_model_aliases(agent: Dict[str, Any]) -> Optional[set]:
@@ -606,7 +629,8 @@ def _execute(wf: Dict[str, Any], run: Dict[str, Any], payload: str) -> None:
                 caps = _caps_for_step(wf, node["id"])
                 prompt = _step_prompt(wf, node, inputs, caps)
                 session = f"wf-{wf['id']}-{run['id'][-10:]}-{node['id']}"
-                reply = _call_agent(agent, prompt, session, model=model)
+                reply = _call_agent(agent, prompt, session, model=model,
+                                    busy_name=cfg.get("agent"))
                 if cfg.get("output") == "json":
                     try:
                         json.loads(_strip_fences(reply))
@@ -616,7 +640,7 @@ def _execute(wf: Dict[str, Any], run: Dict[str, Any], payload: str) -> None:
                             "\n\nYour previous reply was not valid JSON. "
                             "Reply again with ONLY the JSON object.\n"
                             f"Previous reply:\n{reply[:4000]}", session,
-                            model=model)
+                            model=model, busy_name=cfg.get("agent"))
                         reply = _strip_fences(reply)
                         json.loads(reply)      # raises → fail()
                 outputs[node["id"]] = reply
@@ -644,7 +668,8 @@ def _execute(wf: Dict[str, Any], run: Dict[str, Any], payload: str) -> None:
                 agent = _get_agent(cfg.get("agent"))
                 message = "\n\n".join(o for _, o in inputs) or "(workflow produced no output)"
                 session = f"wf-{wf['id']}-{run['id'][-10:]}-{node['id']}"
-                reply = _call_agent(agent, _channel_prompt(node, message), session)
+                reply = _call_agent(agent, _channel_prompt(node, message), session,
+                                    busy_name=cfg.get("agent"))
                 outputs[node["id"]] = message
                 nr["output"] = f"delivery reply: {reply[:500]}"
 
@@ -819,7 +844,8 @@ def builder_chat(wf_id: str, message: str) -> str:
         res=json.dumps(resources(), indent=1),
         message=message)
     session = f"wf-builder-{wf_id}"
-    reply = _call_agent(agent, prompt, session=session, timeout=600)
+    reply = _call_agent(agent, prompt, session=session, timeout=600,
+                        busy_name=BUILDER_AGENT)
     doc, text = _extract_doc(reply)
     if not doc:
         return text
@@ -827,7 +853,8 @@ def builder_chat(wf_id: str, message: str) -> str:
         save_workflow(wf_id, doc, updated_by=BUILDER_AGENT)
     except ValueError as err:
         reply = _call_agent(agent, _BUILDER_RETRY.format(err=err),
-                            session=session, timeout=600)
+                            session=session, timeout=600,
+                            busy_name=BUILDER_AGENT)
         doc, text = _extract_doc(reply)
         if not doc:
             return text
