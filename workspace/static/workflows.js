@@ -1070,8 +1070,24 @@ function wfWatchRun() {
 function wfUpdateRunChip() {
   const el = document.getElementById("wf-runchip");
   if (!el) return;
-  el.innerHTML = wfRun
-    ? `<span class="wf-status ${esc(wfRun.status)}">${esc(wfRun.status)}</span>` : "";
+  if (!wfRun) { el.innerHTML = ""; return; }
+  const active = ["running", "waiting"].includes(wfRun.status);
+  const stopping = active && wfRun.cancel;
+  el.innerHTML = `
+    <span class="wf-status ${esc(wfRun.status)}">${stopping ? "stopping…" : esc(wfRun.status)}</span>
+    ${active && !stopping
+      ? `<button class="act danger" id="wf-stop-btn" style="margin-left:8px">⏹ Stop</button>` : ""}`;
+  el.querySelector("#wf-stop-btn")?.addEventListener("click", wfStopRun);
+}
+
+async function wfStopRun() {
+  if (!wfRun || !wfCur) return;
+  try {
+    wfRun = await api(`/api/workflows/${wfCur.id}/runs/${wfRun.id}/cancel`,
+      { method: "POST" });
+    wfUpdateRunChip();
+    toast("Stopping — the run halts as soon as the current step finishes");
+  } catch (e) { toast(e.message, true); }
 }
 
 function wfBanner() {
