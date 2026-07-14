@@ -13,17 +13,30 @@ import os
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import orchestrator as orc
+import workflows as wfl
 from auth import AuthGate
 from proxy import DashboardProxy, agent_for_host
 
 app = FastAPI(title="Hermes Orchestrator")
 STATIC = Path(__file__).parent / "static"
+
+
+@app.exception_handler(HTTPException)
+async def _log_http_errors(request: Request, exc: HTTPException):
+    """Surface handled API errors in the journal — uvicorn runs at warning
+    level with no access log, which made 4xx responses undiagnosable."""
+    from fastapi.responses import JSONResponse
+    if exc.status_code >= 400:
+        print(f"[api {exc.status_code}] {request.method} {request.url.path}"
+              f" :: {exc.detail}", flush=True)
+    return JSONResponse({"detail": exc.detail}, status_code=exc.status_code,
+                        headers=getattr(exc, "headers", None))
 
 # Public domain the workspace is served under (e.g. orchestrator.kundlas.com).
 # When set, agent dashboards are exposed at https://<agent>.<domain>/ through
@@ -207,6 +220,147 @@ def api_sync():
     return orc.sync_shared(force=True)
 
 
+# ─── workflows ───────────────────────────────────────────────────────────────
+
+class WorkflowCreate(BaseModel):
+    name: str
+    description: str = ""
+
+
+class WorkflowDoc(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    nodes: list | None = None
+    edges: list | None = None
+
+
+class WorkflowRunStart(BaseModel):
+    input: str = ""
+
+
+class WorkflowApprove(BaseModel):
+    node_id: str
+    approve: bool = True
+
+
+class WorkflowChat(BaseModel):
+    workflow_id: str
+    message: str
+
+
+@app.get("/api/workflows")
+def api_workflows():
+    return wfl.list_workflows()
+
+
+@app.post("/api/workflows")
+def api_workflow_create(body: WorkflowCreate):
+    return wfl.create_workflow(body.name, body.description)
+
+
+@app.get("/api/workflows/resources")
+def api_workflow_resources():
+    return wfl.resources()
+
+
+@app.post("/api/workflows/chat")
+def api_workflow_chat(body: WorkflowChat):
+    try:
+        reply = wfl.builder_chat(body.workflow_id, body.message)
+        doc = wfl.load_workflow(body.workflow_id)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(409, str(exc))
+    except Exception as exc:
+        raise HTTPException(502, f"workflow-builder unreachable: {exc}")
+    return {"reply": reply, "workflow": doc}
+
+
+@app.get("/api/workflows/{wf_id}")
+def api_workflow_get(wf_id: str):
+    try:
+        return wfl.load_workflow(wf_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
+
+
+@app.put("/api/workflows/{wf_id}")
+def api_workflow_save(wf_id: str, body: WorkflowDoc):
+    try:
+        return wfl.save_workflow(wf_id, body.model_dump(exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.delete("/api/workflows/{wf_id}")
+def api_workflow_delete(wf_id: str):
+    try:
+        wfl.delete_workflow(wf_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"ok": True}
+
+
+@app.post("/api/workflows/{wf_id}/run")
+def api_workflow_run(wf_id: str, body: WorkflowRunStart):
+    try:
+        return wfl.start_run(wf_id, trigger="manual", payload=body.input)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.get("/api/workflows/{wf_id}/runs")
+def api_workflow_runs(wf_id: str):
+    try:
+        return wfl.list_runs(wf_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
+
+
+@app.get("/api/workflows/{wf_id}/runs/{run_id}")
+def api_workflow_run_get(wf_id: str, run_id: str):
+    try:
+        return wfl.load_run(run_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
+
+
+@app.post("/api/workflows/{wf_id}/runs/{run_id}/approve")
+def api_workflow_approve(wf_id: str, run_id: str, body: WorkflowApprove):
+    try:
+        return wfl.approve_run(run_id, body.node_id, body.approve)
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(404, str(exc))
+
+
+@app.post("/api/workflows/{wf_id}/runs/{run_id}/cancel")
+def api_workflow_cancel(wf_id: str, run_id: str):
+    try:
+        return wfl.cancel_run(run_id)
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(404, str(exc))
+
+
+@app.post("/api/hooks/{wf_id}/{secret}")
+async def api_workflow_hook(wf_id: str, secret: str, request: Request):
+    """External webhook trigger — authenticated by the per-workflow secret
+    (the auth gate exempts /api/hooks/*)."""
+    try:
+        wf = wfl.load_workflow(wf_id)
+    except ValueError:
+        raise HTTPException(404, "no such workflow")
+    import hmac as _hmac
+    if not _hmac.compare_digest(secret, wf.get("hook_secret", "")):
+        raise HTTPException(403, "bad secret")
+    if not any(n.get("type") == "trigger.webhook" for n in wf["nodes"]):
+        raise HTTPException(409, "workflow has no webhook trigger node")
+    payload = (await request.body()).decode("utf-8", "replace")[:100_000]
+    try:
+        run = wfl.start_run(wf_id, trigger="webhook", payload=payload)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"ok": True, "run_id": run["id"]}
+
+
 def _require(name: str) -> None:
     if name not in orc.load_registry()["agents"]:
         raise HTTPException(404, f"No such agent: {name}")
@@ -215,6 +369,22 @@ def _require(name: str) -> None:
 @app.get("/")
 def index():
     return FileResponse(STATIC / "index.html")
+
+
+_SPA_VIEWS = {"agents", "workflows", "graph", "shared", "clis", "incidents"}
+
+
+@app.get("/workflows/{wf_id}")
+def spa_workflow(wf_id: str):
+    """Deep link to an open workflow editor — the SPA routes client-side."""
+    return FileResponse(STATIC / "index.html")
+
+
+@app.get("/{view_name}")
+def spa_view(view_name: str):
+    if view_name in _SPA_VIEWS:
+        return FileResponse(STATIC / "index.html")
+    raise HTTPException(404, "not found")
 
 
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
@@ -243,6 +413,13 @@ def bootstrap() -> None:
             "Repairs other agents automatically when the watchdog reports an incident",
             soul=(Path(__file__).parent / "fixer_soul.md").read_text(),
         )
+    if wfl.BUILDER_AGENT not in orc.load_registry()["agents"]:
+        orc.create_agent(
+            wfl.BUILDER_AGENT,
+            "Builds and edits workflows from chat — describe what you want and watch it appear on the canvas",
+            soul=(Path(__file__).parent / "workflow_builder_soul.md").read_text(),
+        )
+    wfl.start_scheduler()
     for name, agent in orc.load_registry()["agents"].items():
         # should_run reflects the user's last start/stop choice and outlives
         # orchestrator restarts; autostart only applies to never-started agents.

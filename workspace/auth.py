@@ -101,7 +101,9 @@ class AuthGate:
             await self.app(scope, receive, send)
             return
         path = scope.get("path", "/")
-        if path in _EXEMPT_PATHS:
+        # /api/hooks/* are workflow webhook triggers — authenticated by the
+        # per-workflow secret in the URL, so external services can call them.
+        if path in _EXEMPT_PATHS or path.startswith("/api/hooks/"):
             await self.app(scope, receive, send)
             return
         if path == "/login" and scope["type"] == "http":

@@ -361,6 +361,17 @@ def adopt_installed() -> List[str]:
     adopted: List[str] = []
     with _lock:
         reg = load_registry()
+        # Re-detect API servers on already-adopted agents: the user may have
+        # enabled/disabled API_SERVER_* in an install's .env since adoption
+        # (detection is read-only — nothing in the install is modified).
+        refreshed = False
+        for agent in reg["agents"].values():
+            if not agent.get("adopted"):
+                continue
+            port, key = _detect_api_server(Path(agent["home"]))
+            if (port, key) != (agent.get("api_port"), agent.get("api_key")):
+                agent["api_port"], agent["api_key"] = port, key
+                refreshed = True
         known_homes = {str(Path(a["home"]).resolve())
                        for a in reg["agents"].values()}
         for unit in _list_gateway_units():
@@ -397,7 +408,7 @@ def adopt_installed() -> List[str]:
             adopted.append(name)
             if not unit["profile"]:
                 seed_shared_from_home(home)
-        if adopted:
+        if adopted or refreshed:
             save_registry(reg)
     return adopted
 

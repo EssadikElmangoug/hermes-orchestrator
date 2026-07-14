@@ -2,18 +2,33 @@
 "use strict";
 
 const $main = document.getElementById("main");
+const VIEWS = ["agents", "workflows", "graph", "shared", "clis", "incidents"];
 let view = "agents";
 let agents = [];
 let openAgent = null;      // name of agent whose detail modal is open
 let openTab = "overview";
 let refreshTimer = null;
 
+/* URL routing: /<view> for every tab, /workflows/<id> for an open editor.
+   The server returns index.html for these paths so refreshes stick. */
+function routeFromLocation() {
+  const parts = location.pathname.split("/").filter(Boolean);
+  view = VIEWS.includes(parts[0]) ? parts[0] : "agents";
+  window.wfRouteId = view === "workflows" ? (parts[1] || null) : undefined;
+  document.querySelectorAll("nav button").forEach(b =>
+    b.classList.toggle("active", b.dataset.view === view));
+}
+
+function navigate(path) {
+  if (location.pathname !== path) history.pushState({}, "", path);
+  routeFromLocation();
+  render();
+}
+
+window.addEventListener("popstate", () => { routeFromLocation(); render(); });
+
 document.querySelectorAll("nav button").forEach(btn => {
-  btn.onclick = () => {
-    view = btn.dataset.view;
-    document.querySelectorAll("nav button").forEach(b => b.classList.toggle("active", b === btn));
-    render();
-  };
+  btn.onclick = () => navigate(`/${btn.dataset.view}`);
 });
 
 async function api(path, opts = {}) {
@@ -282,8 +297,10 @@ async function renderGraph() {
     <div id="graph-wrap">
       <div id="graph-toolbar">
         <button class="act" id="g-fit">⤢ Fit</button>
+        <button class="act" id="g-zoom-in" title="Zoom in">＋</button>
+        <button class="act" id="g-zoom-out" title="Zoom out">−</button>
         <button class="act" id="g-reset">↺ Reset layout</button>
-        <span class="hint">drag nodes · drag canvas to pan · scroll to zoom · click for details</span>
+        <span class="hint">drag nodes · drag canvas to pan · scroll or pinch to zoom · click for details</span>
       </div>
       <svg id="graph-svg">
         <defs>
@@ -377,19 +394,54 @@ async function renderGraph() {
 
   /* interactions */
   let drag = null;   // {id?, startX, startY, origin, moved}
+  let pinch = null;  // {d0, k0, world0} two-finger zoom state
+  const pointers = new Map();   // active pointerId -> {x, y}
   const toWorld = (cx, cy) => {
     const r = svg.getBoundingClientRect();
     return { x: (cx - r.left - gview.x) / gview.k, y: (cy - r.top - gview.y) / gview.k };
   };
+  const zoomAt = (mx, my, factor) => {
+    const k = Math.min(2.5, Math.max(0.25, gview.k * factor));
+    gview.x = mx - (mx - gview.x) * (k / gview.k);
+    gview.y = my - (my - gview.y) * (k / gview.k);
+    gview.k = k;
+    applyView(); saveGraphState();
+  };
   svg.addEventListener("pointerdown", e => {
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    try { svg.setPointerCapture(e.pointerId); } catch {}
+    if (pointers.size === 2) {
+      // second finger down: switch from drag/pan to pinch-zoom
+      const [p1, p2] = [...pointers.values()];
+      const r = svg.getBoundingClientRect();
+      const mid = { x: (p1.x + p2.x) / 2 - r.left, y: (p1.y + p2.y) / 2 - r.top };
+      pinch = {
+        d0: Math.hypot(p1.x - p2.x, p1.y - p2.y) || 1,
+        k0: gview.k,
+        world0: { x: (mid.x - gview.x) / gview.k, y: (mid.y - gview.y) / gview.k },
+      };
+      drag = null;
+      return;
+    }
     const nodeEl = e.target.closest(".gnode");
-    svg.setPointerCapture(e.pointerId);
     drag = nodeEl
       ? { id: nodeEl.dataset.id, start: toWorld(e.clientX, e.clientY),
           origin: { ...gpos[nodeEl.dataset.id] }, moved: false }
       : { pan: true, startX: e.clientX - gview.x, startY: e.clientY - gview.y, moved: false };
   });
   svg.addEventListener("pointermove", e => {
+    if (pointers.has(e.pointerId)) pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pinch && pointers.size >= 2) {
+      const [p1, p2] = [...pointers.values()];
+      const r = svg.getBoundingClientRect();
+      const mid = { x: (p1.x + p2.x) / 2 - r.left, y: (p1.y + p2.y) / 2 - r.top };
+      const d = Math.hypot(p1.x - p2.x, p1.y - p2.y) || 1;
+      gview.k = Math.min(2.5, Math.max(0.25, pinch.k0 * d / pinch.d0));
+      gview.x = mid.x - pinch.world0.x * gview.k;
+      gview.y = mid.y - pinch.world0.y * gview.k;
+      applyView();
+      return;
+    }
     if (!drag) return;
     drag.moved = true;
     if (drag.pan) {
@@ -400,27 +452,34 @@ async function renderGraph() {
       draw();
     }
   });
-  svg.addEventListener("pointerup", e => {
-    if (drag && !drag.moved && drag.id) {
+  const endPointer = e => {
+    pointers.delete(e.pointerId);
+    if (pinch) {
+      if (pointers.size < 2) { pinch = null; saveGraphState(); }
+      return;
+    }
+    if (drag && !drag.moved && drag.id && e.type === "pointerup") {
       const n = data.nodes.find(x => x.id === drag.id);
       if (n) openDetail(n.type === "subagent" ? drag.id.split("/")[0] : drag.id,
                         n.type === "subagent" ? "subagents" : "overview");
     }
     if (drag && drag.moved) saveGraphState();
     drag = null;
-  });
+  };
+  svg.addEventListener("pointerup", endPointer);
+  svg.addEventListener("pointercancel", endPointer);
   svg.addEventListener("wheel", e => {
     e.preventDefault();
     const r = svg.getBoundingClientRect();
-    const mx = e.clientX - r.left, my = e.clientY - r.top;
-    const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
-    const k = Math.min(2.5, Math.max(0.25, gview.k * factor));
-    gview.x = mx - (mx - gview.x) * (k / gview.k);
-    gview.y = my - (my - gview.y) * (k / gview.k);
-    gview.k = k;
-    applyView(); saveGraphState();
+    zoomAt(e.clientX - r.left, e.clientY - r.top, e.deltaY < 0 ? 1.12 : 1 / 1.12);
   }, { passive: false });
 
+  const zoomCenter = factor => {
+    const r = svg.getBoundingClientRect();
+    zoomAt(r.width / 2, r.height / 2, factor);
+  };
+  document.getElementById("g-zoom-in").onclick = () => zoomCenter(1.3);
+  document.getElementById("g-zoom-out").onclick = () => zoomCenter(1 / 1.3);
   document.getElementById("g-fit").onclick = fit;
   document.getElementById("g-reset").onclick = () => {
     gpos = {}; gview = null; localStorage.removeItem("graph.pos");
@@ -436,7 +495,7 @@ async function renderGraph() {
       const defaults2 = defaultLayout(fresh);
       fresh.nodes.forEach(n => { if (!gpos[n.id]) gpos[n.id] = { ...defaults2[n.id] }; });
       data = fresh;
-      if (!drag) draw();
+      if (!drag && !pinch) draw();
     } catch {}
   }, 8000);
 }
@@ -550,19 +609,21 @@ window.removeCli = async (name) => {
 async function renderIncidents() {
   const inc = await api("/api/incidents");
   $main.innerHTML = inc.length ? `
-    <table>
-      <tr><th>#</th><th>Time</th><th>Agent</th><th>Type</th><th>Detail</th><th>Auto action</th><th>Fixer</th></tr>
-      ${inc.map(i => `
+    <div class="table-wrap">
+    <table class="incidents">
+      <thead><tr><th>#</th><th>Time</th><th>Agent</th><th>Type</th><th>Detail</th><th>Auto action</th><th>Fixer</th></tr></thead>
+      <tbody>${inc.map(i => `
         <tr>
-          <td>${i.id}</td>
-          <td style="white-space:nowrap">${new Date(i.ts * 1000).toLocaleTimeString()}</td>
-          <td><b>${esc(i.agent)}</b></td>
-          <td class="kind-${esc(i.kind)}">${esc(i.kind)}</td>
-          <td class="detail">${esc(i.detail.slice(0, 400))}</td>
-          <td>${esc(i.action)}</td>
-          <td class="detail">${esc(i.fixer)}</td>
+          <td data-label="#">${i.id}</td>
+          <td data-label="Time" style="white-space:nowrap">${new Date(i.ts * 1000).toLocaleTimeString()}</td>
+          <td data-label="Agent"><b>${esc(i.agent)}</b></td>
+          <td data-label="Type" class="kind-${esc(i.kind)}">${esc(i.kind)}</td>
+          <td data-label="Detail" class="detail">${esc(i.detail.slice(0, 400))}</td>
+          <td data-label="Action">${esc(i.action)}</td>
+          <td data-label="Fixer" class="detail">${esc(i.fixer)}</td>
         </tr>`).join("")}
-    </table>`
+      </tbody>
+    </table></div>`
     : `<div class="empty">No incidents — everything has been running clean.</div>`;
 }
 
@@ -578,11 +639,14 @@ async function refresh() {
 function render() {
   clearInterval(refreshTimer);
   clearInterval(graphTimer);
+  if (typeof wfTeardown === "function") wfTeardown();
   if (view === "agents") { renderAgents(); refresh(); refreshTimer = setInterval(refresh, 5000); }
+  else if (view === "workflows") { renderWorkflows(); }
   else if (view === "graph") { renderGraph(); }
   else if (view === "shared") { renderShared(); }
   else if (view === "clis") { renderClis(); }
   else if (view === "incidents") { renderIncidents(); refreshTimer = setInterval(renderIncidents, 6000); }
 }
 
+routeFromLocation();
 refresh().then(render);

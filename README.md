@@ -28,6 +28,7 @@ Re-run the same command any time to update.
 | | |
 |---|---|
 | **Fleet UI** | Create, start, stop, and delete agents from a web dashboard. Each agent gets its own home, ports, and native Hermes dashboard. |
+| **Visual workflows** | An n8n-style canvas: chain agent steps into automations, attach skills/CLI tools/MCP servers to each step, gate on human approval, and deliver results to a linked channel (Telegram, WhatsApp…). Triggered manually, on a cron schedule, or by webhook. A built-in *workflow-builder* agent constructs workflows from plain-language chat — you watch them appear on the canvas. |
 | **Shared everything** | Provider logins, API keys, model/MCP config, skills, plugins, memories, CLI tools, and webhook routes are shared across the whole fleet. When any agent (or you) adds a skill, plugin, or tool, every other agent gets it automatically — running agents are reloaded so they actually see it. |
 | **Adopts existing installs** | Already run Hermes on the machine? The workspace discovers it and manages it **read-only** — it appears in the fleet, and its skills, logins, and tools seed the shared layer, but the workspace never writes into it. |
 | **Watchdog + self-repair** | Crashed gateways restart automatically. Incidents (crashes, log errors, failed health checks) are dispatched to a dedicated *fixer* agent that investigates and repairs. |
@@ -49,6 +50,22 @@ Re-run the same command any time to update.
 | Webhooks | `webhook_subscriptions.json` | merged per-route |
 
 Channel identity (Telegram, WhatsApp, dashboard ports…) always stays **per-agent** and is never shared.
+
+## Workflows
+
+The **Workflows** tab is a drag-and-drop canvas for chaining the fleet into
+automations — e.g. *manual/cron/webhook trigger → researcher agent (with a
+research skill attached) → writer agent → human approval → deliver to
+Telegram*. Steps run through each agent's OpenAI-compatible API server
+(enable with `API_SERVER_ENABLED=1` + `API_SERVER_PORT`/`KEY` in the agent's
+`.env` — workspace-created agents have it on by default), each step receiving
+the labeled outputs of its upstream steps. Runs show live on the canvas with
+per-node output, history, and resume-worthy approval gates; failures raise
+incidents that the fixer picks up like any other fleet problem.
+
+Don't want to build it by hand? Open the ✨ **AI Build** chat: a default
+`workflow-builder` agent (provisioned like the fixer) designs and edits the
+workflow document for you while the canvas live-renders every change.
 
 ## Serving it on a domain (optional)
 

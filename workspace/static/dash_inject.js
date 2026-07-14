@@ -71,7 +71,7 @@
       "position:fixed;inset:0;z-index:2147483000;background:rgba(2,6,14,.9);overflow:auto;" +
       "font:14px/1.5 system-ui,sans-serif;color:#e6edf3;padding:5vh 16px;box-sizing:border-box";
     bg.innerHTML =
-      '<div style="max-width:820px;margin:0 auto;background:#10151d;border:1px solid #2a3038;border-radius:14px;padding:26px">' +
+      '<div style="max-width:820px;margin:0 auto;background:#10151d;border:1px solid #2a3038;border-radius:14px;padding:clamp(14px,4vw,26px)">' +
       '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">' +
       '<div style="font-size:16px;letter-spacing:2px;text-transform:uppercase;color:#d4a017">&#9880; Shared CLI Tools</div>' +
       '<button id="ws-cli-close" style="background:none;border:1px solid #2a3038;color:#8b949e;border-radius:8px;padding:6px 14px;cursor:pointer">Close</button></div>' +

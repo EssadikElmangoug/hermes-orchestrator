@@ -116,6 +116,9 @@ EOF
     fi
     systemctl --user daemon-reload
     systemctl --user enable --now hermes-orchestrator.service
+    # 'enable --now' does NOT restart an already-running service, which would
+    # leave a pre-update process serving old code after a 'git pull' update.
+    systemctl --user restart hermes-orchestrator.service
     # keep the user service alive after logout on headless servers
     loginctl enable-linger "$USER" >/dev/null 2>&1 || true
     say "Service started."
