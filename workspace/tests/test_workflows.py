@@ -222,6 +222,66 @@ def test_json_output_retry(env):
     assert json.loads(run["nodes"]["s1"]["output"]) == {"title": "ok"}
 
 
+def test_json_output_accepts_surrounding_prose(env):
+    """JSON with prose around it must pass without a retry round-trip."""
+    wf = wfl.create_workflow("json2")
+    doc = wfl.load_workflow(wf["id"])
+    doc["nodes"].append({"id": "s1", "type": "step.agent",
+                         "config": {"agent": "alpha", "output": "json"}})
+    doc["edges"] = [{"from": "trigger", "to": "s1", "kind": "flow"}]
+    wfl.save_workflow(wf["id"], doc)
+    _StubHandler.reply = ('Here is the result:\n{"title": "ok"}\n\n'
+                          "Let me know if you need anything else!")
+    run = wfl.start_run(wf["id"])
+    run = _wait(run["id"], {"success"})
+    assert json.loads(run["nodes"]["s1"]["output"]) == {"title": "ok"}
+    assert len(_StubHandler.prompts) == 1
+
+
+def test_extract_json():
+    assert wfl._extract_json('{"a": 1} Hope that helps!') == '{"a": 1}'
+    assert wfl._extract_json(
+        'Sure:\n```json\n{"a": [1, 2]}\n```\nDone.') == '{"a": [1, 2]}'
+    assert wfl._extract_json(
+        'Result:\n{"a": {"b": 2}}\ntrailing notes') == '{"a": {"b": 2}}'
+    with pytest.raises(ValueError):
+        wfl._extract_json("no json here { broken")
+
+
+def test_call_agent_retries_on_connection_drop(monkeypatch):
+    """First request dies with 'Remote end closed connection without
+    response' (gateway restarted mid-call); the retry must succeed."""
+    calls = []
+
+    class Flaky(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            calls.append(1)
+            if len(calls) == 1:
+                self.connection.close()      # no response at all
+                return
+            payload = json.dumps(
+                {"choices": [{"message": {"content": "second try"}}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *a):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Flaky)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    naps = []
+    monkeypatch.setattr(wfl.time, "sleep", lambda s: naps.append(s))
+    agent = {"api_port": server.server_address[1], "api_key": "k"}
+    try:
+        assert wfl._call_agent(agent, "hi", "sess") == "second try"
+    finally:
+        server.shutdown()
+    assert len(calls) == 2 and naps
+
+
 def test_webhook_out_and_cancel(env, stub_agent):
     received = []
 

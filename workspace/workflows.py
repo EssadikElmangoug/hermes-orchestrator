@@ -449,13 +449,21 @@ def _call_agent(agent: Dict[str, Any], prompt: str, session: str,
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
                     data = json.loads(resp.read())
                 return data["choices"][0]["message"]["content"]
-            except urllib.error.URLError as exc:
+            except (urllib.error.URLError, ConnectionResetError) as exc:
                 # Connection refused = the request never reached the agent
-                # (it is restarting) — safe to retry once after a grace
-                # period. Anything else is ambiguous and must surface.
-                refused = isinstance(getattr(exc, "reason", None),
-                                     ConnectionRefusedError)
-                if not refused or attempt == 2:
+                # (it is restarting). Connection reset / "Remote end closed
+                # connection without response" = the gateway went away before
+                # producing a response (self-reload on config/skill changes,
+                # launchd/systemd restart — the busy flag only defers
+                # workspace-driven reloads). Either way no reply was
+                # produced, so retry once after a grace period. Anything
+                # else is ambiguous and must surface. RemoteDisconnected is
+                # a ConnectionResetError and may arrive raw (not wrapped in
+                # URLError), hence both the except tuple and the check.
+                reason = getattr(exc, "reason", exc)
+                transient = isinstance(
+                    reason, (ConnectionRefusedError, ConnectionResetError))
+                if not transient or attempt == 2:
                     raise
                 time.sleep(20)
     finally:
@@ -513,6 +521,27 @@ _CAP_HINTS = {
 def _strip_fences(text: str) -> str:
     m = re.search(r"```(?:json)?\s*(.*?)```", text, re.S)
     return (m.group(1) if m else text).strip()
+
+
+def _extract_json(text: str) -> str:
+    """First complete JSON object/array in an agent reply, as its exact
+    source text. Tolerates code fences, prose before the JSON, and trailing
+    text after it — plain json.loads rejects e.g. '{...} Hope that helps!'
+    with 'Extra data'. Raises ValueError when no JSON value is present."""
+    dec = json.JSONDecoder()
+    for cand in (_strip_fences(text), text.strip()):
+        pos = 0
+        while True:
+            m = re.search(r"[\[{]", cand[pos:])
+            if not m:
+                break
+            start = pos + m.start()
+            try:
+                _, end = dec.raw_decode(cand, start)
+                return cand[start:end]
+            except ValueError:
+                pos = start + 1
+    raise ValueError("reply contains no valid JSON object")
 
 
 def _step_prompt(wf: Dict[str, Any], node: Dict[str, Any],
@@ -633,16 +662,14 @@ def _execute(wf: Dict[str, Any], run: Dict[str, Any], payload: str) -> None:
                                     busy_name=cfg.get("agent"))
                 if cfg.get("output") == "json":
                     try:
-                        json.loads(_strip_fences(reply))
-                        reply = _strip_fences(reply)
+                        reply = _extract_json(reply)
                     except Exception:
                         reply = _call_agent(agent, prompt +
                             "\n\nYour previous reply was not valid JSON. "
                             "Reply again with ONLY the JSON object.\n"
                             f"Previous reply:\n{reply[:4000]}", session,
                             model=model, busy_name=cfg.get("agent"))
-                        reply = _strip_fences(reply)
-                        json.loads(reply)      # raises → fail()
+                        reply = _extract_json(reply)   # raises → fail()
                 outputs[node["id"]] = reply
                 nr["output"] = reply[:MAX_OUTPUT_CHARS]
 
