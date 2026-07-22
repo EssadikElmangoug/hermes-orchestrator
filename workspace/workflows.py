@@ -513,8 +513,9 @@ _CAP_HINTS = {
     "cap.skill": 'Use the shared skill "{name}" (installed in your skills folder — read and follow it).',
     "cap.cli": 'Use the shared CLI tool "{name}" (on your PATH; its manifest is in your clis folder).',
     "cap.mcp": 'Use the MCP server "{name}" (configured in your config).',
-    "cap.env": 'The environment variable "{name}" is set in your environment for this task.',
     "cap.plugin": 'Use the plugin "{name}" (installed in your shared plugins).',
+    # cap.env is intentionally absent — it needs its value resolved and
+    # injected, which _cap_line() handles specially.
 }
 
 
@@ -544,8 +545,31 @@ def _extract_json(text: str) -> str:
     raise ValueError("reply contains no valid JSON object")
 
 
+def _cap_line(cap: Dict[str, Any], env_values: Dict[str, str]) -> Optional[str]:
+    """One '## Capabilities' bullet for a linked capability node, or None.
+
+    Unlike skills/CLIs/MCP/plugins — which are real artifacts already on disk
+    in the agent's home, so a "read and follow it" hint is enough — an env var
+    is just a KEY=value pair the model cannot see by being told it exists. So
+    for cap.env we resolve the value from the executing agent's .env and inject
+    it inline; the model gets the value the same way a skill gives it info."""
+    t = cap["type"]
+    name = cap.get("config", {}).get("name", "?")
+    if t == "cap.env":
+        val = env_values.get(name)
+        if val is not None:
+            return (f'The environment variable "{name}" is available for this '
+                    f'step. Its value is: {val}')
+        return (f'The environment variable "{name}" should be set in your '
+                f'environment for this task (read it yourself if you need it).')
+    if t in _CAP_HINTS:
+        return _CAP_HINTS[t].format(name=name)
+    return None
+
+
 def _step_prompt(wf: Dict[str, Any], node: Dict[str, Any],
-                 inputs: List[tuple], caps: List[Dict[str, Any]]) -> str:
+                 inputs: List[tuple], caps: List[Dict[str, Any]],
+                 env_values: Optional[Dict[str, str]] = None) -> str:
     cfg = node.get("config", {})
     parts = [
         f'You are executing the step "{node_label(node)}" of the automated '
@@ -554,9 +578,11 @@ def _step_prompt(wf: Dict[str, Any], node: Dict[str, Any],
         "\n## Your task\n" + (cfg.get("instruction") or "Process the input and produce a useful result."),
     ]
     if caps:
-        parts.append("\n## Capabilities to use for this step\n" + "\n".join(
-            "- " + _CAP_HINTS[c["type"]].format(name=c.get("config", {}).get("name", "?"))
-            for c in caps if c["type"] in _CAP_HINTS))
+        lines = [_cap_line(c, env_values or {}) for c in caps]
+        lines = [ln for ln in lines if ln]
+        if lines:
+            parts.append("\n## Capabilities to use for this step\n"
+                         + "\n".join("- " + ln for ln in lines))
     if inputs:
         blocks = [f"### From “{label}”\n{out or '(empty)'}" for label, out in inputs]
         parts.append("\n## Input from previous steps\n" + "\n\n".join(blocks))
@@ -656,7 +682,14 @@ def _execute(wf: Dict[str, Any], run: Dict[str, Any], payload: str) -> None:
                     _check_model(cfg.get("agent"), agent, model)
                     nr["model"] = model
                 caps = _caps_for_step(wf, node["id"])
-                prompt = _step_prompt(wf, node, inputs, caps)
+                # Resolve linked env-var values from the agent that will run
+                # this step, so cap.env nodes carry the actual value into the
+                # prompt (skills et al. are already-readable files on disk;
+                # an env var is not, so telling the model it "is set" is not
+                # enough — it has to be handed the value).
+                env_values = (orc._read_env_keys(Path(agent["home"]) / ".env")
+                              if any(c["type"] == "cap.env" for c in caps) else {})
+                prompt = _step_prompt(wf, node, inputs, caps, env_values)
                 session = f"wf-{wf['id']}-{run['id'][-10:]}-{node['id']}"
                 reply = _call_agent(agent, prompt, session, model=model,
                                     busy_name=cfg.get("agent"))

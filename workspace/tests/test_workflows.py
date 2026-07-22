@@ -168,6 +168,30 @@ def test_run_chains_outputs(env):
     assert "Research" in _StubHandler.prompts[1]
 
 
+def test_env_cap_injects_value(env, tmp_path):
+    # A cap.env node linked to a step must carry the variable's actual VALUE
+    # into the prompt — unlike a skill, the model can't read an env var just
+    # by being told it exists.
+    (tmp_path / "alpha").mkdir(exist_ok=True)
+    (tmp_path / "alpha" / ".env").write_text(
+        'OTHER=nope\nAPI_BASE_URL="https://api.example.test/v2"\n')
+    wf = wfl.create_workflow("envflow")
+    doc = wfl.load_workflow(wf["id"])
+    doc["nodes"] += [
+        {"id": "s1", "type": "step.agent", "config": {"agent": "alpha"}},
+        {"id": "e1", "type": "cap.env", "config": {"name": "API_BASE_URL"}},
+    ]
+    doc["edges"] = [{"from": "trigger", "to": "s1", "kind": "flow"},
+                    {"from": "e1", "to": "s1", "kind": "cap"}]
+    wfl.save_workflow(wf["id"], doc)
+    run = wfl.start_run(wf["id"], payload="go")
+    _wait(run["id"], {"success"})
+    prompt = _StubHandler.prompts[0]
+    assert "API_BASE_URL" in prompt
+    assert "https://api.example.test/v2" in prompt   # the value, not just the key
+    assert "OTHER" not in prompt                      # only the linked var
+
+
 def test_run_failure_records_incident(env):
     wf = wfl.create_workflow("broken")
     doc = wfl.load_workflow(wf["id"])
