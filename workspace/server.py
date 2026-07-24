@@ -340,6 +340,51 @@ def api_workflow_cancel(wf_id: str, run_id: str):
         raise HTTPException(404, str(exc))
 
 
+# ─── agent surface (hermes-workflow CLI) ─────────────────────────────────────
+# Read/run only, token-authenticated: fleet agents may list and execute
+# workflows, never create, edit, or delete them.
+
+def _agent_auth(request: Request) -> None:
+    import hmac as _hmac
+    token = request.headers.get("X-Workspace-Token", "")
+    if not token or not _hmac.compare_digest(token, orc.workspace_token()):
+        raise HTTPException(403, "bad or missing workspace agent token")
+
+
+@app.get("/api/agent/workflows")
+def api_agent_workflows(request: Request):
+    _agent_auth(request)
+    return {"workflows": wfl.list_workflows()}
+
+
+@app.get("/api/agent/workflows/{wf_id}")
+def api_agent_workflow(wf_id: str, request: Request):
+    _agent_auth(request)
+    try:
+        return wfl.workflow_detail(wf_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
+
+
+@app.post("/api/agent/workflows/{wf_id}/run")
+def api_agent_workflow_run(wf_id: str, body: WorkflowRunStart, request: Request):
+    _agent_auth(request)
+    try:
+        run = wfl.start_run(wf_id, trigger="agent", payload=body.input)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"ok": True, "run_id": run["id"], "status": run["status"]}
+
+
+@app.get("/api/agent/runs/{run_id}")
+def api_agent_run(run_id: str, request: Request):
+    _agent_auth(request)
+    try:
+        return wfl.run_summary(wfl.load_run(run_id))
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
+
+
 @app.post("/api/hooks/{wf_id}/{secret}")
 async def api_workflow_hook(wf_id: str, secret: str, request: Request):
     """External webhook trigger — authenticated by the per-workflow secret

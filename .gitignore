@@ -12,6 +12,7 @@ workspace/*.log
 workspace/*.json
 workspace/shared/
 workspace/auth_secret
+workspace/agent_token
 workspace/dash_logs/
 workspace/dash_cache/
 workspace/unit_snapshots/

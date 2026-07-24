@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""hermes-workflow — discover and run Hermes Orchestrator workflows.
+
+Lets any agent in the fleet execute a workflow by name ("run my facebook
+workflow") without knowing workflow ids. Talks to the workspace's agent API
+on 127.0.0.1, authenticated by the workspace agent token.
+
+Stdlib only — it runs under whatever python3 the agent has.
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+DEFAULT_URL = "http://127.0.0.1:9100"
+TERMINAL = {"success", "failed", "cancelled", "rejected"}
+
+
+# ─── locating the workspace ──────────────────────────────────────────────────
+
+def _token_from_tree() -> str:
+    """Walk up from this script's real location looking for the workspace's
+    agent_token. The shared bin dir is <workspace>/shared/bin, and agent homes
+    symlink it, so realpath() lands inside the workspace even when we were
+    invoked through a symlink on PATH."""
+    here = Path(os.path.realpath(__file__)).parent
+    for base in [here, *here.parents]:
+        for cand in (base / "agent_token", base / "workspace" / "agent_token"):
+            try:
+                tok = cand.read_text().strip()
+            except OSError:
+                continue
+            if tok:
+                return tok
+    return ""
+
+
+def _token() -> str:
+    tok = os.environ.get("HERMES_WORKSPACE_TOKEN", "").strip()
+    if tok:
+        return tok
+    path = os.environ.get("HERMES_WORKSPACE_TOKEN_FILE", "").strip()
+    if path:
+        try:
+            return Path(path).read_text().strip()
+        except OSError:
+            pass
+    tok = _token_from_tree()
+    if tok:
+        return tok
+    for cand in ("/root/hermes-orchestrator/workspace/agent_token",
+                 str(Path.home() / "hermes-orchestrator/workspace/agent_token")):
+        try:
+            tok = Path(cand).read_text().strip()
+        except OSError:
+            continue
+        if tok:
+            return tok
+    return ""
+
+
+def _base_url() -> str:
+    return os.environ.get("HERMES_WORKSPACE_URL", "").strip() or DEFAULT_URL
+
+
+# ─── API ─────────────────────────────────────────────────────────────────────
+
+def _api(path: str, method: str = "GET", body=None, timeout: int = 30):
+    url = _base_url().rstrip("/") + path
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers={
+        "Content-Type": "application/json",
+        "X-Workspace-Token": _token(),
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:400]
+        if exc.code in (401, 403):
+            _die("the workspace rejected this agent's token. Ensure the "
+                 "orchestrator is running and this agent's shared .env has "
+                 f"HERMES_WORKSPACE_TOKEN (server said: {detail})")
+        _die(f"workspace API error HTTP {exc.code}: {detail}")
+    except urllib.error.URLError as exc:
+        _die(f"cannot reach the workspace at {_base_url()} ({exc.reason}). "
+             "Is the hermes-orchestrator service running?")
+
+
+def _die(msg: str) -> "None":
+    print(f"hermes-workflow: {msg}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+# ─── name resolution ─────────────────────────────────────────────────────────
+
+def _resolve(query: str, workflows) -> dict:
+    """Map a human phrase ("facebook", "my Facebook post flow") to one
+    workflow. Exact id/name first, then substring, then fuzzy."""
+    if not workflows:
+        _die("no workflows exist yet — create one in the workspace UI first.")
+    q = query.strip().lower()
+    for wf in workflows:
+        if wf["id"].lower() == q or wf["name"].strip().lower() == q:
+            return wf
+    subs = [w for w in workflows if q in w["name"].lower() or q in w["id"].lower()]
+    if len(subs) == 1:
+        return subs[0]
+    if len(subs) > 1:
+        names = ", ".join(f'"{w["name"]}"' for w in subs)
+        _die(f'"{query}" matches several workflows: {names}. Be more specific.')
+    names = [w["name"] for w in workflows]
+    close = difflib.get_close_matches(query, names, n=3, cutoff=0.5)
+    if len(close) == 1:
+        return next(w for w in workflows if w["name"] == close[0])
+    hint = f" Did you mean: {', '.join(close)}?" if close else ""
+    avail = ", ".join(f'"{n}"' for n in names[:12])
+    _die(f'no workflow matches "{query}".{hint} Available: {avail}')
+
+
+def _fmt_age(ts) -> str:
+    if not ts:
+        return "never"
+    d = max(0, int(time.time() - ts))
+    for unit, n in (("d", 86400), ("h", 3600), ("m", 60)):
+        if d >= n:
+            return f"{d // n}{unit} ago"
+    return "just now"
+
+
+# ─── commands ────────────────────────────────────────────────────────────────
+
+def cmd_list(args) -> int:
+    wfs = _api("/api/agent/workflows")["workflows"]
+    if args.json:
+        print(json.dumps(wfs, indent=2))
+        return 0
+    if not wfs:
+        print("No workflows exist yet.")
+        return 0
+    print(f"{'NAME':<28}{'STEPS':<7}{'LAST RUN':<22}DESCRIPTION")
+    for w in wfs:
+        last = w.get("last_run")
+        lr = f"{last['status']} {_fmt_age(last['ts'])}" if last else "never"
+        print(f"{w['name'][:27]:<28}{w['nodes']:<7}{lr[:21]:<22}"
+              f"{(w.get('description') or '')[:40]}")
+    return 0
+
+
+def cmd_show(args) -> int:
+    wf = _resolve(args.name, _api("/api/agent/workflows")["workflows"])
+    detail = _api(f"/api/agent/workflows/{wf['id']}")
+    print(json.dumps(detail, indent=2) if args.json else
+          f"{detail['name']} (id: {detail['id']})\n"
+          f"{detail.get('description') or '(no description)'}\n"
+          f"steps: {', '.join(detail.get('steps') or []) or '(none)'}\n"
+          f"triggers: {', '.join(detail.get('triggers') or []) or '(none)'}")
+    return 0
+
+
+def cmd_run(args) -> int:
+    wf = _resolve(args.name, _api("/api/agent/workflows")["workflows"])
+    started = _api(f"/api/agent/workflows/{wf['id']}/run", "POST",
+                   {"input": args.input or ""})
+    run_id = started["run_id"]
+    if not args.wait:
+        print(f'Started workflow "{wf["name"]}" (run {run_id}).')
+        return 0
+    deadline = time.time() + args.timeout
+    run = None
+    while time.time() < deadline:
+        run = _api(f"/api/agent/runs/{run_id}")
+        if run["status"] in TERMINAL:
+            break
+        time.sleep(3)
+    else:
+        print(f'Workflow "{wf["name"]}" is still running after {args.timeout}s. '
+              f'Check later with: hermes-workflow status {run_id}')
+        return 0
+    return _report(wf["name"], run, args.json)
+
+
+def cmd_status(args) -> int:
+    return _report(None, _api(f"/api/agent/runs/{args.run_id}"), args.json)
+
+
+def _report(name, run, as_json: bool) -> int:
+    if as_json:
+        print(json.dumps(run, indent=2))
+        return 0 if run["status"] == "success" else 1
+    label = name or run.get("workflow_name", "workflow")
+    if run["status"] == "success":
+        print(f'Workflow "{label}" finished successfully.\n')
+        print(run.get("final_output") or "(no output)")
+        return 0
+    if run["status"] == "failed":
+        print(f'Workflow "{label}" FAILED at step "{run.get("failed_step") or "?"}": '
+              f'{run.get("error") or "unknown error"}', file=sys.stderr)
+        return 1
+    print(f'Workflow "{label}" is {run["status"]} (run {run["id"]}).')
+    if run["status"] == "waiting":
+        print("It is waiting for human approval in the workspace UI.")
+    return 0
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        prog="hermes-workflow",
+        description="List and run Hermes Orchestrator workflows by name.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    lst = sub.add_parser("list", help="list every workflow in the workspace")
+    lst.add_argument("--json", action="store_true")
+    lst.set_defaults(func=cmd_list)
+
+    show = sub.add_parser("show", help="show one workflow's steps and triggers")
+    show.add_argument("name")
+    show.add_argument("--json", action="store_true")
+    show.set_defaults(func=cmd_show)
+
+    run = sub.add_parser("run", help="run a workflow by name and print its result")
+    run.add_argument("name")
+    run.add_argument("--input", default="", help="text passed to the trigger")
+    run.add_argument("--no-wait", dest="wait", action="store_false",
+                     help="start it and return immediately")
+    run.add_argument("--timeout", type=int, default=300,
+                     help="seconds to wait for completion (default 300)")
+    run.add_argument("--json", action="store_true")
+    run.set_defaults(func=cmd_run, wait=True)
+
+    st = sub.add_parser("status", help="check a run started earlier")
+    st.add_argument("run_id")
+    st.add_argument("--json", action="store_true")
+    st.set_defaults(func=cmd_status)
+
+    args = p.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

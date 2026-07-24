@@ -410,6 +410,49 @@ def node_label(node: Dict[str, Any]) -> str:
             "trigger.webhook": "webhook trigger"}.get(t, t)
 
 
+def workflow_detail(wf_id: str) -> Dict[str, Any]:
+    """Name/description/steps/triggers of one workflow — what an agent needs to
+    describe it to a user without exposing the raw graph."""
+    wf = load_workflow(wf_id)
+    steps, triggers = [], []
+    for n in wf["nodes"]:
+        if n["type"] == "step.agent":
+            steps.append(node_label(n))
+        elif n["type"].startswith("trigger."):
+            triggers.append(n["type"].split(".", 1)[1])
+    return {"id": wf["id"], "name": wf.get("name", wf["id"]),
+            "description": wf.get("description", ""),
+            "steps": steps, "triggers": triggers}
+
+
+def run_summary(run: Dict[str, Any]) -> Dict[str, Any]:
+    """Compact run view for the agent API: status, the output a user actually
+    wants back, and which step broke when it failed."""
+    out = {
+        "id": run["id"], "workflow_id": run.get("workflow_id", ""),
+        "workflow_name": run.get("workflow_name", ""),
+        "status": run.get("status", ""), "trigger": run.get("trigger", ""),
+        "started": run.get("started"), "finished": run.get("finished"),
+        "error": run.get("error", ""),
+    }
+    nodes = run.get("nodes") or {}
+    try:
+        wf = load_workflow(run["workflow_id"])
+        order = [n["id"] for n in _topo_order(wf)]
+        labels = {n["id"]: node_label(n) for n in wf["nodes"]}
+    except Exception:
+        order, labels = list(nodes), {}
+    final = ""
+    for nid in order:
+        nr = nodes.get(nid) or {}
+        if nr.get("output"):
+            final = nr["output"]        # last producer in execution order
+        if nr.get("status") == "failed":
+            out["failed_step"] = labels.get(nid, nid)
+    out["final_output"] = final
+    return out
+
+
 def _caps_for_step(doc: Dict[str, Any], step_id: str) -> List[Dict[str, Any]]:
     by_id = {n["id"]: n for n in doc["nodes"]}
     return [by_id[e["from"]] for e in doc["edges"]

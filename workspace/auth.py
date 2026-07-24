@@ -103,7 +103,12 @@ class AuthGate:
         path = scope.get("path", "/")
         # /api/hooks/* are workflow webhook triggers — authenticated by the
         # per-workflow secret in the URL, so external services can call them.
-        if path in _EXEMPT_PATHS or path.startswith("/api/hooks/"):
+        # /api/agent/* is the fleet's own surface (hermes-workflow); it carries
+        # the workspace agent token in a header and checks it per-endpoint,
+        # because agents have no session cookie and must not hold the
+        # workspace password.
+        if (path in _EXEMPT_PATHS or path.startswith("/api/hooks/")
+                or path.startswith("/api/agent/")):
             await self.app(scope, receive, send)
             return
         if path == "/login" and scope["type"] == "http":

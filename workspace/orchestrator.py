@@ -107,8 +107,16 @@ def _next_port(reg: Dict[str, Any], key: str, base: int) -> int:
 # and hermes-gateway-<profile>.service) get those gateways ADOPTED into the
 # workspace: they appear in the agent list, graph and dashboards, can be
 # started/stopped through their own systemd unit, and their config seeds the
-# shared layer — but the workspace NEVER writes into their homes, .env,
-# config, memory or profiles. Breaking an existing install is not an option.
+# shared layer — but the workspace never writes their .env, config.yaml,
+# memories, auth, souls, plugins or systemd units. Breaking an existing
+# install is not an option.
+#
+# The single exception is additive documentation: the workspace's OWN seed
+# skills and CLI manifests (plus a delimited managed block in the hermes-agent
+# skill) are copied into adopted homes by seed_docs_into_home(), because an
+# agent that cannot see them has no way to know fleet workflows exist. Nothing
+# functional is altered, no pre-existing file is rewritten outside its managed
+# block, and HERMES_NO_ADOPTED_DOCS=1 turns even that off.
 
 _UNIT_RE = re.compile(r"^(hermes-gateway(?:-([a-z0-9][a-z0-9-]*))?)\.service$")
 
@@ -698,8 +706,39 @@ def _apply_shared_config(home: Path, shared_cfg: Dict[str, Any]) -> bool:
 # them without any manual step.
 
 SEED_SKILLS_DIR = WORKSPACE / "seed_skills"
+SEED_BIN_DIR = WORKSPACE / "seed_bin"
+SEED_CLIS_DIR = WORKSPACE / "seed_clis"
+AGENT_TOKEN_PATH = WORKSPACE / "agent_token"
 _DOC_BLOCK_BEGIN = "<!-- >>> hermes-orchestrator workspace (managed block — edits inside are overwritten) >>> -->"
 _DOC_BLOCK_END = "<!-- <<< hermes-orchestrator workspace <<< -->"
+
+
+def workspace_token() -> str:
+    """Shared secret letting fleet agents call the workspace's /api/agent/*
+    surface (list/run workflows). Created once, then stable — it is handed to
+    agents through the shared .env block and readable from the workspace dir by
+    adopted agents, whose homes we must never write to."""
+    try:
+        tok = AGENT_TOKEN_PATH.read_text().strip()
+        if tok:
+            return tok
+    except OSError:
+        pass
+    tok = secrets.token_urlsafe(32)
+    with _lock:
+        try:                      # another thread may have won the race
+            existing = AGENT_TOKEN_PATH.read_text().strip()
+            if existing:
+                return existing
+        except OSError:
+            pass
+        AGENT_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+        AGENT_TOKEN_PATH.write_text(tok)
+        try:
+            AGENT_TOKEN_PATH.chmod(0o600)
+        except OSError:
+            pass
+    return tok
 
 _HERMES_AGENT_SKILL_NOTE = """
 ## This machine: Hermes Orchestrator workspace — resources are FLEET-SHARED
@@ -725,6 +764,27 @@ Practical consequences:
   server identity always stay per-agent and are never shared.
 - The machine's pre-installed Hermes agent and its systemd units are
   READ-ONLY to this workspace — never modify them.
+
+## Running workspace workflows
+
+The workspace also stores named **workflows** — saved graphs of agent steps the
+user builds on a canvas. They are shared fleet-wide, so you can run any of them
+from any channel with the `hermes-workflow` CLI (already on your PATH):
+
+```
+hermes-workflow list                  # what exists
+hermes-workflow run <name>            # run it, wait, print the final output
+hermes-workflow run <name> --input "…"   # pass the user's text to the trigger
+hermes-workflow status <run-id>       # check a run started earlier
+```
+
+Whenever a user asks you to run/execute/trigger a workflow by name ("run my
+facebook workflow"), use this instead of improvising the steps yourself — the
+name is matched loosely, so their phrasing usually just works. "<name>
+workflow" always means a saved workspace workflow to execute, NOT a topic
+skill about <name>: reach for `hermes-workflow run <name>` first, and only
+treat it as a topic request if no workflow matches. Read the `workflows`
+skill (workspace category) for the full playbook.
 
 Read the `shared-resources` skill (workspace category) for full details, and
 the `cli-tools` skill for the CLI manifest format.
@@ -777,25 +837,100 @@ def seed_workspace_docs() -> List[str]:
     files are overwritten) and refresh the managed workspace section in the
     shared hermes-agent skill."""
     changed: List[str] = []
-    if SEED_SKILLS_DIR.is_dir():
-        for src in SEED_SKILLS_DIR.rglob("*"):
+    ensure_shared_seed()
+    for seed_dir, sub in ((SEED_SKILLS_DIR, "skills"), (SEED_BIN_DIR, "bin"),
+                          (SEED_CLIS_DIR, "clis")):
+        if not seed_dir.is_dir():
+            continue
+        for src in seed_dir.rglob("*"):
             if not src.is_file():
                 continue
-            rel = src.relative_to(SEED_SKILLS_DIR)
-            dst = SHARED_DIR / "skills" / rel
+            rel = src.relative_to(seed_dir)
+            dst = SHARED_DIR / sub / rel
             try:
                 if not dst.exists() or dst.read_bytes() != src.read_bytes():
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(src, dst)
-                    changed.append(f"skills/{rel}")
+                    changed.append(f"{sub}/{rel}")
+                if sub == "bin":
+                    dst.chmod(0o755)
             except OSError:
                 pass
+    _link_system_bin()
     hermes_skill = (SHARED_DIR / "skills" / "autonomous-ai-agents"
                     / "hermes-agent" / "SKILL.md")
     if hermes_skill.is_file() and _upsert_marked_block(
             hermes_skill, _HERMES_AGENT_SKILL_NOTE):
         changed.append("hermes-agent/SKILL.md (workspace section)")
     return changed
+
+
+def _adopted_docs_enabled() -> bool:
+    return not _truthy(os.environ.get("HERMES_NO_ADOPTED_DOCS", ""))
+
+
+def seed_docs_into_home(home: Path) -> List[str]:
+    """Copy the workspace's own skills + CLI manifests into ONE agent home.
+
+    Adopted agents have no symlink to the shared layer, so this is the only way
+    they can learn that fleet workflows and shared resources exist — without it
+    they can run `hermes-workflow` but would never think to. Deliberately
+    narrow: only files the workspace itself authors (its seed skills, its CLI
+    manifests, and a delimited managed block in the hermes-agent skill) are
+    written. config.yaml, .env, memories, auth, souls, plugins and systemd
+    units are never touched, so an existing install keeps working exactly as
+    before. Set HERMES_NO_ADOPTED_DOCS=1 to leave adopted homes pristine."""
+    changed: List[str] = []
+    for seed_dir, sub in ((SEED_SKILLS_DIR, "skills"), (SEED_CLIS_DIR, "clis")):
+        if not seed_dir.is_dir():
+            continue
+        for src in seed_dir.rglob("*"):
+            if not src.is_file():
+                continue
+            rel = src.relative_to(seed_dir)
+            dst = home / sub / rel
+            try:
+                if dst.exists() and dst.read_bytes() == src.read_bytes():
+                    continue
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+                changed.append(f"{sub}/{rel}")
+            except OSError:
+                pass
+    # Only refresh an existing hermes-agent skill — never invent one.
+    hermes_skill = (home / "skills" / "autonomous-ai-agents"
+                    / "hermes-agent" / "SKILL.md")
+    if hermes_skill.is_file() and _upsert_marked_block(
+            hermes_skill, _HERMES_AGENT_SKILL_NOTE):
+        changed.append("hermes-agent/SKILL.md (workspace section)")
+    return changed
+
+
+def _link_system_bin() -> None:
+    """Expose the seeded CLIs at /usr/local/bin too.
+
+    Adopted (pre-installed) agents are read-only — we never link the shared bin
+    into their homes — so a system-wide symlink is the only way they can run
+    workflow commands. Symlink (not copy) so it keeps resolving back into the
+    workspace, which is how the CLI finds the agent token. Best-effort: a
+    read-only or unwritable /usr/local/bin is not an error."""
+    target_dir = Path("/usr/local/bin")
+    if not SEED_BIN_DIR.is_dir() or not os.access(target_dir, os.W_OK):
+        return
+    for src in SEED_BIN_DIR.iterdir():
+        if not src.is_file():
+            continue
+        shared_copy = SHARED_DIR / "bin" / src.name
+        link = target_dir / src.name
+        try:
+            if link.is_symlink() and link.readlink() == shared_copy:
+                continue
+            if link.exists() and not link.is_symlink():
+                continue          # a real binary someone else installed — leave it
+            link.unlink(missing_ok=True)
+            link.symlink_to(shared_copy)
+        except OSError:
+            pass
 
 
 def _merge_cfg_edits(prev: Dict[str, Any], view: Dict[str, Any],
@@ -890,6 +1025,13 @@ def sync_shared(restart_changed: bool = True, force: bool = False) -> Dict[str, 
         report: Dict[str, Any] = {"synced_at": time.time(),
                                   "editors": [e[1] for e in editors],
                                   "changed": [], "restarted": []}
+        # Workspace-owned keys: agents need these to call the /api/agent/*
+        # surface (hermes-workflow). Forced every pass so they can't drift —
+        # they are ours, not an agent edit to be merged.
+        new_env["HERMES_WORKSPACE_URL"] = (
+            f"HERMES_WORKSPACE_URL=http://127.0.0.1:{WORKSPACE_PORT}")
+        new_env["HERMES_WORKSPACE_TOKEN"] = (
+            f"HERMES_WORKSPACE_TOKEN={workspace_token()}")
         env_lines = [new_env[k] for k in sorted(new_env)]
         for name, agent in reg["agents"].items():
             home = Path(agent["home"])
@@ -913,6 +1055,15 @@ def sync_shared(restart_changed: bool = True, force: bool = False) -> Dict[str, 
                             include_auth=False, include_webhooks=False)
                 except Exception:
                     pass
+                # ...and the workspace's own docs flow the other way, so every
+                # agent — adopted or workspace-created, present or future —
+                # knows how to discover and run fleet workflows.
+                if _adopted_docs_enabled():
+                    try:
+                        if seed_docs_into_home(home):
+                            report["changed"].append(f"{name} (workspace docs)")
+                    except Exception:
+                        pass
                 continue
             changed = _ensure_shared_links(home)
             changed |= _apply_shared_config(home, new_cfg)
